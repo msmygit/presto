@@ -195,11 +195,8 @@ public class CassandraClientModule
                         config.getClientSoLinger());
             }
 
-            // Schema metadata configuration - include ALL keyspaces (including system)
-            // By default, driver 4.x filters out system keyspaces, but we need them for size estimates
-            // According to driver 4.x docs, an empty list means include ALL keyspaces
-            configLoaderBuilder.withStringList(DefaultDriverOption.METADATA_SCHEMA_REFRESHED_KEYSPACES,
-                    java.util.Collections.emptyList());
+            // Schema metadata configuration removed - empty list means NO keyspaces are refreshed
+            // The driver will use its default behavior which includes necessary keyspaces
 
             DriverConfigLoader configLoader = configLoaderBuilder.build();
             sessionBuilder.withConfigLoader(configLoader);

@@ -36,6 +36,14 @@
             <scope>runtime</scope>
         </dependency>
 
+        <!-- JNA is required by Cassandra driver 4.x at runtime for native memory access -->
+        <!-- It's transitively provided by presto-common but needs to be runtime for the plugin -->
+        <dependency>
+            <groupId>net.java.dev.jna</groupId>
+            <artifactId>jna</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+
         <dependency>
             <groupId>org.weakref</groupId>
             <artifactId>jmxutils</artifactId>

@@ -223,22 +223,10 @@ public class CassandraPageSink
         log.info("=== CassandraPageSink: Finishing write to %s.%s with %d rows written ===",
                 schemaName, tableName, rowsWritten);
 
-        // Driver 4.x: Add delay to handle eventual consistency
-        // This ensures data is visible immediately after INSERT for test reliability
+        // Schema refresh to ensure metadata is current after writes
         if (rowsWritten > 0) {
-            try {
-                // Force schema refresh to ensure metadata is current
-                cassandraSession.refreshSchema();
-                
-                // Increase delay to 2 seconds for better consistency in CI environment
-                Thread.sleep(2000);
-                
-                log.info("Applied 2000ms delay + schema refresh after %d row(s) written", rowsWritten);
-            }
-            catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                log.warn("Interrupted while waiting for data propagation");
-            }
+            cassandraSession.refreshSchema();
+            log.info("Schema refreshed after %d row(s) written", rowsWritten);
         }
 
         CassandraWriteMetadata metadata = new CassandraWriteMetadata(rowsWritten);
