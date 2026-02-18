@@ -106,7 +106,7 @@ public class NativeCassandraSession
     private final ReopeningSession reopeningSession;
     private final Supplier<CqlSession> session;
     private final Duration noHostAvailableRetryTimeout;
-    private static boolean caseSensitiveNameMatchingEnabled;
+    private boolean caseSensitiveNameMatchingEnabled;
 
     public NativeCassandraSession(
             String connectorId,
@@ -346,7 +346,7 @@ public class NativeCassandraSession
                 : actualName.equalsIgnoreCase(expectedName);
     }
 
-    private static TableMetadata getTableMetadata(KeyspaceMetadata keyspace, String caseSensitiveTableName)
+    private TableMetadata getTableMetadata(KeyspaceMetadata keyspace, String caseSensitiveTableName)
     {
         List<TableMetadata> tables = Stream.concat(
                 keyspace.getTables().values().stream(),
