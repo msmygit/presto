@@ -13,6 +13,8 @@
  */
 #pragma once
 
+#include <unordered_map>
+
 #include "presto_cpp/main/types/PrestoToVeloxExpr.h"
 #include "presto_cpp/presto_protocol/connector/hive/presto_protocol_hive.h"
 #include "presto_cpp/presto_protocol/core/presto_protocol_core.h"
@@ -53,7 +55,6 @@ velox::connector::hive::HiveColumnHandle::ColumnType toHiveColumnType(
 std::unique_ptr<velox::connector::ConnectorTableHandle> toHiveTableHandle(
     const protocol::TupleDomain<protocol::Subfield>& domainPredicate,
     const std::shared_ptr<protocol::RowExpression>& remainingPredicate,
-    bool isPushdownFilterEnabled,
     const std::string& tableName,
     const protocol::List<protocol::Column>& dataColumns,
     const protocol::TableHandle& tableHandle,
@@ -62,5 +63,17 @@ std::unique_ptr<velox::connector::ConnectorTableHandle> toHiveTableHandle(
     const protocol::Map<protocol::String, protocol::String>& tableParameters,
     const VeloxExprConverter& exprConverter,
     const TypeParser& typeParser);
+
+/// Extracts nimble serde parameters (nimble.* and alpha.*) from table
+/// parameters.
+void extractNimbleSerdeParameters(
+    const std::map<std::string, std::string>& tableParameters,
+    std::unordered_map<std::string, std::string>& serdeParameters);
+
+/// Extracts serde parameters (textfile delimiters, nimble.* and alpha.* config)
+/// from additionalTableParameters during CTAS.
+/// Mirrors Java's HiveMetadata.extractSerdeParameters().
+std::unordered_map<std::string, std::string> extractSerdeParameters(
+    const std::map<std::string, std::string>& tableParameters);
 
 } // namespace facebook::presto

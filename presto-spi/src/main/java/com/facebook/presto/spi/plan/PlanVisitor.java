@@ -169,4 +169,19 @@ public abstract class PlanVisitor<R, C>
     {
         return visitPlan(node, context);
     }
+
+    public R visitTopNRowNumber(TopNRowNumberNode node, C context)
+    {
+        return visitPlan(node, context);
+    }
+
+    public R visitMVRewriteCandidates(MVRewriteCandidatesNode node, C context)
+    {
+        return visitPlan(node, context);
+    }
+
+    public R visitRefreshMaterializedView(RefreshMaterializedViewNode node, C context)
+    {
+        return visitPlan(node, context);
+    }
 }

@@ -135,6 +135,7 @@ public class PrestoNativeQueryRunnerUtils
         private boolean enableSsdCache;
         private boolean failOnNestedLoopJoin;
         private boolean implicitCastCharNToVarchar;
+        private boolean enableCudf;
         // External worker launcher is applicable only for the native hive query runner, since it depends on other
         // properties it should be created once all the other query runner configs are set. This variable indicates
         // whether the query runner returned by builder should use an external worker launcher, it will be true only
@@ -235,6 +236,17 @@ public class PrestoNativeQueryRunnerUtils
             return this;
         }
 
+        /**
+         * Enable cuDF-accelerated query execution on the native worker.
+         * GPU clusters currently support single worker nodes only.
+         */
+        public HiveQueryRunnerBuilder setEnableCudf(boolean enableCudf)
+        {
+            this.enableCudf = enableCudf;
+            this.workerCount = 1;
+            return this;
+        }
+
         public HiveQueryRunnerBuilder setBuiltInWorkerFunctionsEnabled(boolean builtInWorkerFunctionsEnabled)
         {
             this.builtInWorkerFunctionsEnabled = builtInWorkerFunctionsEnabled;
@@ -294,7 +306,7 @@ public class PrestoNativeQueryRunnerUtils
             Optional<BiFunction<Integer, URI, Process>> externalWorkerLauncher = Optional.empty();
             if (this.useExternalWorkerLauncher) {
                 externalWorkerLauncher = getExternalWorkerLauncher("hive", "hive", serverBinary, cacheMaxSize, remoteFunctionServerUds,
-                        pluginDirectory, failOnNestedLoopJoin, coordinatorSidecarEnabled, builtInWorkerFunctionsEnabled, enableRuntimeMetricsCollection, enableSsdCache, implicitCastCharNToVarchar);
+                        pluginDirectory, failOnNestedLoopJoin, coordinatorSidecarEnabled, builtInWorkerFunctionsEnabled, enableRuntimeMetricsCollection, enableSsdCache, implicitCastCharNToVarchar, enableCudf);
             }
             return HiveQueryRunner.createQueryRunner(
                     ImmutableList.of(),
@@ -336,6 +348,7 @@ public class PrestoNativeQueryRunnerUtils
         private Map<String, String> extraConnectorProperties = new HashMap<>();
         private Optional<String> remoteFunctionServerUds = Optional.empty();
         private boolean addStorageFormatToPath;
+        private Optional<String> schemaName = Optional.empty();
         // External worker launcher is applicable only for the native iceberg query runner, since it depends on other
         // properties it should be created once all the other query runner configs are set. This variable indicates
         // whether the query runner returned by builder should use an external worker launcher, it will be true only
@@ -388,6 +401,36 @@ public class PrestoNativeQueryRunnerUtils
             return this;
         }
 
+        public IcebergQueryRunnerBuilder setCatalogType(CatalogType catalogType)
+        {
+            this.catalogType = catalogType;
+            return this;
+        }
+
+        public IcebergQueryRunnerBuilder setExtraProperty(String key, String value)
+        {
+            this.extraProperties.put(key, value);
+            return this;
+        }
+
+        public IcebergQueryRunnerBuilder setExtraConnectorProperty(String key, String value)
+        {
+            this.extraConnectorProperties.put(key, value);
+            return this;
+        }
+
+        public IcebergQueryRunnerBuilder setSchemaName(String schemaName)
+        {
+            this.schemaName = Optional.of(schemaName);
+            return this;
+        }
+
+        public IcebergQueryRunnerBuilder setDataDirectory(Path dataDirectory)
+        {
+            this.dataDirectory = dataDirectory;
+            return this;
+        }
+
         public QueryRunner build()
                 throws Exception
         {
@@ -400,9 +443,9 @@ public class PrestoNativeQueryRunnerUtils
             Optional<BiFunction<Integer, URI, Process>> externalWorkerLauncher = Optional.empty();
             if (this.useExternalWorkerLauncher) {
                 externalWorkerLauncher = getExternalWorkerLauncher("iceberg", "iceberg", serverBinary, cacheMaxSize, remoteFunctionServerUds,
-                        Optional.empty(), false, false, false, false, false, false);
+                        Optional.empty(), false, false, false, false, false, false, false);
             }
-            return IcebergQueryRunner.builder()
+            IcebergQueryRunner.Builder builder = IcebergQueryRunner.builder()
                     .setExtraProperties(extraProperties)
                     .setExtraConnectorProperties(extraConnectorProperties)
                     .setFormat(FileFormat.valueOf(storageFormat))
@@ -413,8 +456,9 @@ public class PrestoNativeQueryRunnerUtils
                     .setAddStorageFormatToPath(addStorageFormatToPath)
                     .setDataDirectory(Optional.of(dataDirectory))
                     .setTpcdsProperties(getNativeWorkerTpcdsProperties())
-                    .setCatalogType(catalogType)
-                    .build();
+                    .setCatalogType(catalogType);
+            schemaName.ifPresent(builder::setSchemaName);
+            return builder.build();
         }
     }
 
@@ -522,7 +566,7 @@ public class PrestoNativeQueryRunnerUtils
             Optional<BiFunction<Integer, URI, Process>> externalWorkerLauncher = Optional.empty();
             if (this.useExternalWorkerLauncher) {
                 externalWorkerLauncher = getExternalWorkerLauncher("delta", "delta", serverBinary, cacheMaxSize, remoteFunctionServerUds,
-                        Optional.empty(), false, false, false, false, false, false);
+                        Optional.empty(), false, false, false, false, false, false, false);
             }
             DeltaQueryRunner.Builder builder = DeltaQueryRunner.builder()
                     .setExtraProperties(extraProperties)
@@ -628,7 +672,8 @@ public class PrestoNativeQueryRunnerUtils
             boolean isBuiltInWorkerFunctionsEnabled,
             boolean enableRuntimeMetricsCollection,
             boolean enableSsdCache,
-            boolean implicitCastCharNToVarchar)
+            boolean implicitCastCharNToVarchar,
+            boolean enableCudf)
     {
         return
                 Optional.of((workerIndex, discoveryUri) -> {
@@ -687,6 +732,12 @@ public class PrestoNativeQueryRunnerUtils
 
                         if (implicitCastCharNToVarchar) {
                             configProperties = format("%s%n" + "char-n-to-varchar-implicit-cast=true%n", configProperties);
+                        }
+
+                        if (enableCudf) {
+                            configProperties = format("%s%n" +
+                                    "cudf.enabled=true%n" +
+                                    "cudf.debug_enabled=true", configProperties);
                         }
 
                         Files.write(tempDirectoryPath.resolve("config.properties"), configProperties.getBytes());

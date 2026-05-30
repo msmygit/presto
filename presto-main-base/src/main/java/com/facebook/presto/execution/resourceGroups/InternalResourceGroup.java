@@ -740,7 +740,18 @@ public class InternalResourceGroup
             else {
                 query.setResourceGroupQueryLimits(perQueryLimits);
                 boolean immediateStartCandidate = canRun && queuedQueries.isEmpty();
-                if (immediateStartCandidate && queryPacingContext.tryAcquireAdmissionSlot()) {
+                boolean startQuery = immediateStartCandidate;
+                if (immediateStartCandidate) {
+                    // Check for coordinator overload (task limit exceeded or denied admission)
+                    //isTaskLimitExceeded MUST be checked before tryAcquireAdmissionSlot, or else admission slots will be acquired but not started
+                    boolean coordOverloaded = ((RootInternalResourceGroup) root).isTaskLimitExceeded()
+                            || !queryPacingContext.tryAcquireAdmissionSlot();
+                    if (coordOverloaded) {
+                        startQuery = false;
+                    }
+                }
+
+                if (startQuery) {
                     startInBackground(query);
                 }
                 else {
@@ -914,6 +925,10 @@ public class InternalResourceGroup
     {
         checkState(Thread.holdsLock(root), "Must hold lock to find next query");
         synchronized (root) {
+            if (((RootInternalResourceGroup) root).isTaskLimitExceeded()) {
+                return false;
+            }
+
             if (!canRunMore()) {
                 return false;
             }
@@ -1039,8 +1054,9 @@ public class InternalResourceGroup
     {
         checkState(Thread.holdsLock(root), "Must hold lock");
         synchronized (root) {
-            // Check if more queries can be run on the cluster based on cluster overload
-            if (clusterResourceChecker.isClusterCurrentlyOverloaded()) {
+            // Check if more queries can be run on the cluster based on cluster overload.
+            // Resource groups in cluster-overload.bypass-resource-groups skip this check.
+            if (clusterResourceChecker.isClusterCurrentlyOverloaded(id)) {
                 return false;
             }
 
@@ -1049,10 +1065,6 @@ public class InternalResourceGroup
             }
 
             if (shouldWaitForResourceManagerUpdate()) {
-                return false;
-            }
-
-            if (((RootInternalResourceGroup) root).isTaskLimitExceeded()) {
                 return false;
             }
 

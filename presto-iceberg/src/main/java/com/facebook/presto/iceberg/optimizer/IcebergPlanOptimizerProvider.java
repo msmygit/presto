@@ -15,7 +15,7 @@ package com.facebook.presto.iceberg.optimizer;
 
 import com.facebook.presto.common.type.TypeManager;
 import com.facebook.presto.iceberg.IcebergTableProperties;
-import com.facebook.presto.iceberg.IcebergTransactionManager;
+import com.facebook.presto.iceberg.transaction.IcebergTransactionManager;
 import com.facebook.presto.spi.ConnectorPlanOptimizer;
 import com.facebook.presto.spi.connector.ConnectorPlanOptimizerProvider;
 import com.facebook.presto.spi.function.FunctionMetadataManager;
@@ -55,6 +55,7 @@ public class IcebergPlanOptimizerProvider
         this.logicalPlanOptimizers = ImmutableSet.of(
                 new IcebergPlanOptimizer(functionResolution, rowExpressionService, functionMetadataManager, transactionManager),
                 new IcebergFilterPushdown(rowExpressionService, functionResolution, functionMetadataManager, transactionManager, typeManager),
+                new IcebergAggregationOptimizer(transactionManager, functionResolution),
                 new IcebergMetadataOptimizer(functionMetadataManager, typeManager, transactionManager, rowExpressionService, functionResolution),
                 new IcebergParquetDereferencePushDown(transactionManager, rowExpressionService, typeManager, tableProperties),
                 new IcebergEqualityDeleteAsJoin(functionResolution, transactionManager, typeManager));

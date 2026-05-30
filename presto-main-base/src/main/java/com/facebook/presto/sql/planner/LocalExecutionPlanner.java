@@ -182,6 +182,7 @@ import com.facebook.presto.spi.plan.TableFinishNode;
 import com.facebook.presto.spi.plan.TableScanNode;
 import com.facebook.presto.spi.plan.TableWriterNode;
 import com.facebook.presto.spi.plan.TopNNode;
+import com.facebook.presto.spi.plan.TopNRowNumberNode;
 import com.facebook.presto.spi.plan.UnionNode;
 import com.facebook.presto.spi.plan.UnnestNode;
 import com.facebook.presto.spi.plan.ValuesNode;
@@ -201,7 +202,6 @@ import com.facebook.presto.spiller.StandaloneSpillerFactory;
 import com.facebook.presto.split.MappedRecordSet;
 import com.facebook.presto.split.PageSinkManager;
 import com.facebook.presto.split.PageSourceProvider;
-import com.facebook.presto.sql.analyzer.FunctionsConfig;
 import com.facebook.presto.sql.gen.ExpressionCompiler;
 import com.facebook.presto.sql.gen.JoinCompiler;
 import com.facebook.presto.sql.gen.JoinFilterFunctionCompiler;
@@ -218,6 +218,7 @@ import com.facebook.presto.sql.planner.plan.GroupIdNode;
 import com.facebook.presto.sql.planner.plan.InternalPlanVisitor;
 import com.facebook.presto.sql.planner.plan.MergeProcessorNode;
 import com.facebook.presto.sql.planner.plan.MergeWriterNode;
+import com.facebook.presto.sql.planner.plan.RPCNode;
 import com.facebook.presto.sql.planner.plan.RemoteSourceNode;
 import com.facebook.presto.sql.planner.plan.RowNumberNode;
 import com.facebook.presto.sql.planner.plan.SampleNode;
@@ -225,13 +226,16 @@ import com.facebook.presto.sql.planner.plan.StatisticsWriterNode;
 import com.facebook.presto.sql.planner.plan.TableFunctionNode;
 import com.facebook.presto.sql.planner.plan.TableFunctionProcessorNode;
 import com.facebook.presto.sql.planner.plan.TableWriterMergeNode;
-import com.facebook.presto.sql.planner.plan.TopNRowNumberNode;
 import com.facebook.presto.sql.planner.plan.UpdateNode;
 import com.facebook.presto.sql.relational.FunctionResolution;
 import com.facebook.presto.sql.relational.VariableToChannelTranslator;
 import com.facebook.presto.sql.tree.SortItem;
 import com.facebook.presto.sql.tree.SymbolReference;
+import com.fasterxml.jackson.annotation.JsonIgnore;
+import com.fasterxml.jackson.core.StreamWriteConstraints;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializationFeature;
+import com.fasterxml.jackson.datatype.jdk8.Jdk8Module;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.VerifyException;
 import com.google.common.collect.ContiguousSet;
@@ -405,8 +409,6 @@ public class LocalExecutionPlanner
     private final ObjectMapper sortedMapObjectMapper;
     private final boolean tableFinishOperatorMemoryTrackingEnabled;
     private final StandaloneSpillerFactory standaloneSpillerFactory;
-    private final boolean useNewNanDefinition;
-
     private static final TypeSignature SPHERICAL_GEOGRAPHY_TYPE_SIGNATURE = parseTypeSignature("SphericalGeography");
 
     @Inject
@@ -424,7 +426,6 @@ public class LocalExecutionPlanner
             IndexJoinLookupStats indexJoinLookupStats,
             TaskManagerConfig taskManagerConfig,
             MemoryManagerConfig memoryManagerConfig,
-            FunctionsConfig functionsConfig,
             SpillerFactory spillerFactory,
             SingleStreamSpillerFactory singleStreamSpillerFactory,
             PartitioningSpillerFactory partitioningSpillerFactory,
@@ -470,10 +471,24 @@ public class LocalExecutionPlanner
         this.fragmentResultCacheManager = requireNonNull(fragmentResultCacheManager, "fragmentResultCacheManager is null");
         this.sortedMapObjectMapper = requireNonNull(objectMapper, "objectMapper is null")
                 .copy()
-                .configure(ORDER_MAP_ENTRIES_BY_KEYS, true);
+                .configure(ORDER_MAP_ENTRIES_BY_KEYS, true)
+                .registerModule(new Jdk8Module())
+                .configure(SerializationFeature.FAIL_ON_SELF_REFERENCES, false)
+                .configure(SerializationFeature.FAIL_ON_EMPTY_BEANS, false);
+
+        // Increasing max nesting depth
+        this.sortedMapObjectMapper.getFactory().setStreamWriteConstraints(
+                StreamWriteConstraints.builder()
+                        .maxNestingDepth(2000)
+                        .build());
+        try {
+            Class<?> sliceClass = Class.forName("io.airlift.slice.Slice");
+            this.sortedMapObjectMapper.addMixIn(sliceClass, SliceMixIn.class);
+        }
+        catch (ClassNotFoundException e) {
+        }
         this.tableFinishOperatorMemoryTrackingEnabled = requireNonNull(memoryManagerConfig, "memoryManagerConfig is null").isTableFinishOperatorMemoryTrackingEnabled();
         this.standaloneSpillerFactory = requireNonNull(standaloneSpillerFactory, "standaloneSpillerFactory is null");
-        this.useNewNanDefinition = requireNonNull(functionsConfig, "functionsConfig is null").getUseNewNanDefinition();
     }
 
     public LocalExecutionPlan plan(
@@ -836,6 +851,15 @@ public class LocalExecutionPlanner
             }
             this.driverInstanceCount = OptionalInt.of(driverInstanceCount);
         }
+    }
+    /**
+     * MixIn to ignore Slice.getOutput() method which causes circular references with BasicSliceOutput.
+     * The circular reference chain: Slice -> BasicSliceOutput.underlyingSlice -> Slice -> ...
+     */
+    private abstract static class SliceMixIn
+    {
+        @JsonIgnore
+        abstract Object getOutput();
     }
 
     private static class IndexSourceContext
@@ -2576,8 +2600,7 @@ public class LocalExecutionPlanner
                     filterBuildChannels,
                     getDynamicFilteringMaxPerDriverRowCount(context.getSession()),
                     getDynamicFilteringMaxPerDriverSize(context.getSession()),
-                    getDynamicFilteringRangeRowLimitPerDriver(context.getSession()),
-                    useNewNanDefinition);
+                    getDynamicFilteringRangeRowLimitPerDriver(context.getSession()));
         }
 
         private Optional<LocalDynamicFilter> createDynamicFilter(PhysicalOperation buildSource, AbstractJoinNode node, LocalExecutionPlanContext context, int partitionCount)
@@ -3376,6 +3399,12 @@ public class LocalExecutionPlanner
         }
 
         @Override
+        public PhysicalOperation visitRPC(RPCNode node, LocalExecutionPlanContext context)
+        {
+            throw new UnsupportedOperationException("RPCNode is handled by Velox native execution");
+        }
+
+        @Override
         public PhysicalOperation visitPlan(PlanNode node, LocalExecutionPlanContext context)
         {
             for (CustomPlanTranslator translator : customPlanTranslators) {
@@ -3648,7 +3677,7 @@ public class LocalExecutionPlanner
             AggregationNode.Step step,
             Session session)
     {
-        if (maxPartialAggregationMemorySize.isPresent() && step.isOutputPartial() && isAdaptivePartialAggregationEnabled(session)) {
+        if (maxPartialAggregationMemorySize.isPresent() && step.isInputRaw() && step.isOutputPartial() && isAdaptivePartialAggregationEnabled(session)) {
             return Optional.of(new PartialAggregationController(maxPartialAggregationMemorySize.get(), getAdaptivePartialAggregationRowsReductionRatioThreshold(session)));
         }
         return Optional.empty();

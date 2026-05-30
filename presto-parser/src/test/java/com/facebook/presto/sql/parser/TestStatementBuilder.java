@@ -223,6 +223,18 @@ public class TestStatementBuilder
         printStatement("alter table a.b.c create or replace branch 'test_branch' for system_version as of 123 retain 7 days");
         printStatement("alter table a.b.c create branch 'test_branch' for system_version as of 123 retain 7 days with snapshot retention 2 snapshots 3 days");
         printStatement("alter table a.b.c create branch if not exists 'test_branch' for system_version as of 123 retain 7 days with snapshot retention 2 snapshots 3 days");
+        printStatement("alter table a.b.c create tag 'test_tag'");
+        printStatement("alter table a.b.c create tag if not exists 'test_tag'");
+        printStatement("alter table a.b.c create or replace tag 'test_tag'");
+        printStatement("alter table a.b.c create tag 'test_tag' for system_version as of 123");
+        printStatement("alter table a.b.c create tag if not exists 'test_tag' for system_version as of 123");
+        printStatement("alter table a.b.c create or replace tag 'test_tag' for system_version as of 123");
+        printStatement("alter table a.b.c create tag 'test_tag' for system_time as of timestamp '2024-01-01 00:00:00'");
+        printStatement("alter table a.b.c create tag if not exists 'test_tag' for system_time as of timestamp '2024-01-01 00:00:00'");
+        printStatement("alter table a.b.c create or replace tag 'test_tag' for system_time as of timestamp '2024-01-01 00:00:00'");
+        printStatement("alter table a.b.c create tag 'test_tag' for system_version as of 123 retain 7 days");
+        printStatement("alter table a.b.c create tag if not exists 'test_tag' for system_version as of 123 retain 7 days");
+        printStatement("alter table a.b.c create or replace tag 'test_tag' for system_version as of 123 retain 7 days");
         printStatement("alter table a.b.c create or replace branch 'test_branch' for system_version as of 123 retain 7 days with snapshot retention 2 snapshots 3 days");
         printStatement("alter table a.b.c drop tag 'testTag'");
 
@@ -250,6 +262,9 @@ public class TestStatementBuilder
         printStatement("create or replace view foo as select 123 from t");
 
         printStatement("drop view foo");
+
+        printStatement("alter table foo alter column x set data type bigint");
+        printStatement("alter table a.b.c alter column x set data type bigint");
 
         printStatement("insert into t select * from t");
         printStatement("insert into t (c1, c2) select * from t");

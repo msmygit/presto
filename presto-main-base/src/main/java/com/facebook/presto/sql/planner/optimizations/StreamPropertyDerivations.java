@@ -40,6 +40,7 @@ import com.facebook.presto.spi.plan.TableFinishNode;
 import com.facebook.presto.spi.plan.TableScanNode;
 import com.facebook.presto.spi.plan.TableWriterNode;
 import com.facebook.presto.spi.plan.TopNNode;
+import com.facebook.presto.spi.plan.TopNRowNumberNode;
 import com.facebook.presto.spi.plan.UnionNode;
 import com.facebook.presto.spi.plan.UnnestNode;
 import com.facebook.presto.spi.plan.ValuesNode;
@@ -58,6 +59,7 @@ import com.facebook.presto.sql.planner.plan.InternalPlanVisitor;
 import com.facebook.presto.sql.planner.plan.LateralJoinNode;
 import com.facebook.presto.sql.planner.plan.MergeProcessorNode;
 import com.facebook.presto.sql.planner.plan.MergeWriterNode;
+import com.facebook.presto.sql.planner.plan.RPCNode;
 import com.facebook.presto.sql.planner.plan.RemoteSourceNode;
 import com.facebook.presto.sql.planner.plan.RowNumberNode;
 import com.facebook.presto.sql.planner.plan.SampleNode;
@@ -66,7 +68,6 @@ import com.facebook.presto.sql.planner.plan.StatisticsWriterNode;
 import com.facebook.presto.sql.planner.plan.TableFunctionNode;
 import com.facebook.presto.sql.planner.plan.TableFunctionProcessorNode;
 import com.facebook.presto.sql.planner.plan.TableWriterMergeNode;
-import com.facebook.presto.sql.planner.plan.TopNRowNumberNode;
 import com.facebook.presto.sql.planner.plan.UpdateNode;
 import com.google.common.collect.ImmutableBiMap;
 import com.google.common.collect.ImmutableList;
@@ -278,6 +279,15 @@ public final class StreamPropertyDerivations
         public StreamProperties visitSequence(SequenceNode node, List<StreamProperties> inputProperties)
         {
             return new StreamProperties(MULTIPLE, Optional.empty(), false);
+        }
+
+        @Override
+        public StreamProperties visitRPC(RPCNode node, List<StreamProperties> inputProperties)
+        {
+            // RPCNode may return rows out of order (PER_ROW mode dispatches
+            // individual RPCs that complete asynchronously), so ordering is
+            // not preserved. Partitioning is unchanged since RPCNode is 1:1.
+            return inputProperties.get(0).unordered(true);
         }
 
         @Override
@@ -657,7 +667,8 @@ public final class StreamPropertyDerivations
             if (node.getStep().equals(TopNNode.Step.PARTIAL)) {
                 return Iterables.getOnlyElement(inputProperties);
             }
-            return StreamProperties.ordered();
+            StreamProperties input = Iterables.getOnlyElement(inputProperties);
+            return StreamProperties.ordered().withStreamPropertiesFromUniqueColumn(input.getStreamPropertiesFromUniqueColumn());
         }
 
         @Override

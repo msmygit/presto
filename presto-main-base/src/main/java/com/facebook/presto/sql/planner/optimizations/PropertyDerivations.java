@@ -50,6 +50,7 @@ import com.facebook.presto.spi.plan.TableFinishNode;
 import com.facebook.presto.spi.plan.TableScanNode;
 import com.facebook.presto.spi.plan.TableWriterNode;
 import com.facebook.presto.spi.plan.TopNNode;
+import com.facebook.presto.spi.plan.TopNRowNumberNode;
 import com.facebook.presto.spi.plan.UnnestNode;
 import com.facebook.presto.spi.plan.ValuesNode;
 import com.facebook.presto.spi.plan.WindowNode;
@@ -69,6 +70,7 @@ import com.facebook.presto.sql.planner.plan.InternalPlanVisitor;
 import com.facebook.presto.sql.planner.plan.LateralJoinNode;
 import com.facebook.presto.sql.planner.plan.MergeProcessorNode;
 import com.facebook.presto.sql.planner.plan.MergeWriterNode;
+import com.facebook.presto.sql.planner.plan.RPCNode;
 import com.facebook.presto.sql.planner.plan.RemoteSourceNode;
 import com.facebook.presto.sql.planner.plan.RowNumberNode;
 import com.facebook.presto.sql.planner.plan.SampleNode;
@@ -77,7 +79,6 @@ import com.facebook.presto.sql.planner.plan.StatisticsWriterNode;
 import com.facebook.presto.sql.planner.plan.TableFunctionNode;
 import com.facebook.presto.sql.planner.plan.TableFunctionProcessorNode;
 import com.facebook.presto.sql.planner.plan.TableWriterMergeNode;
-import com.facebook.presto.sql.planner.plan.TopNRowNumberNode;
 import com.facebook.presto.sql.planner.plan.UpdateNode;
 import com.facebook.presto.sql.relational.RowExpressionDomainTranslator;
 import com.google.common.collect.ImmutableBiMap;
@@ -821,6 +822,22 @@ public class PropertyDerivations
                 RowExpression expression = assignment.getValue();
                 VariableReferenceExpression output = assignment.getKey();
 
+                // Variable reference assignments (identity or renaming) and constants never
+                // produce new constant information from the interpreter. Skip them to avoid
+                // expensive RowExpressionInterpreter construction for wide projections.
+                if (expression instanceof VariableReferenceExpression) {
+                    VariableReferenceExpression inputVar = (VariableReferenceExpression) expression;
+                    ConstantExpression existingConstantValue = properties.getConstants().get(inputVar);
+                    if (existingConstantValue != null) {
+                        constants.put(output, existingConstantValue);
+                    }
+                    continue;
+                }
+                if (expression instanceof ConstantExpression) {
+                    constants.put(output, (ConstantExpression) expression);
+                    continue;
+                }
+
                 // TODO:
                 // We want to use a symbol resolver that looks up in the constants from the input subplan
                 // to take advantage of constant-folding for complex expressions
@@ -831,7 +848,7 @@ public class PropertyDerivations
                 if (value instanceof VariableReferenceExpression) {
                     ConstantExpression existingConstantValue = constants.get(value);
                     if (existingConstantValue != null) {
-                        constants.put(output, new ConstantExpression(((VariableReferenceExpression) value).getSourceLocation(), value, expression.getType()));
+                        constants.put(output, existingConstantValue);
                     }
                 }
                 else if (!(value instanceof RowExpression)) {
@@ -918,6 +935,18 @@ public class PropertyDerivations
         {
             // Return the rightmost node properties
             return context.get(context.size() - 1);
+        }
+
+        @Override
+        public ActualProperties visitRPC(RPCNode node, List<ActualProperties> inputProperties)
+        {
+            // RPCNode may return rows out of order (PER_ROW mode dispatches
+            // individual RPCs that complete asynchronously), so local ordering
+            // properties (SortingProperty) must be stripped. Partitioning and
+            // grouping properties are preserved since RPCNode is 1:1.
+            return ActualProperties.builderFrom(inputProperties.get(0))
+                    .unordered(true)
+                    .build();
         }
 
         @Override

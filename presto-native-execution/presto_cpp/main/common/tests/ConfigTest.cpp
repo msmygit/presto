@@ -225,7 +225,7 @@ TEST_F(ConfigTest, optionalNodeConfigs) {
 TEST_F(ConfigTest, optionalSystemConfigsWithDefault) {
   SystemConfig config;
   init(config, {});
-  ASSERT_EQ(config.maxDriversPerTask(), folly::hardware_concurrency());
+  ASSERT_EQ(config.maxDriversPerTask(), folly::available_concurrency());
   init(config, {{std::string(SystemConfig::kMaxDriversPerTask), "1024"}});
   ASSERT_EQ(config.maxDriversPerTask(), 1024);
 }
@@ -239,6 +239,20 @@ TEST_F(ConfigTest, asyncCacheNumShards) {
   // Test custom value
   init(config, {{std::string(SystemConfig::kAsyncCacheNumShards), "8"}});
   ASSERT_EQ(config.asyncCacheNumShards(), 8);
+}
+
+TEST_F(ConfigTest, asyncCacheSsdFlushThresholdBytes) {
+  SystemConfig config;
+  init(config, {});
+  // Test default value is 0
+  ASSERT_EQ(config.asyncCacheSsdFlushThresholdBytes(), 0);
+
+  // Test custom value
+  init(
+      config,
+      {{std::string(SystemConfig::kAsyncCacheSsdFlushThresholdBytes),
+        "134217728"}});
+  ASSERT_EQ(config.asyncCacheSsdFlushThresholdBytes(), 134217728);
 }
 
 TEST_F(ConfigTest, remoteFunctionServer) {

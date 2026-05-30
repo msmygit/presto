@@ -27,11 +27,12 @@ jobs:
           filters: |
             codechange:
               - '!presto-docs/**'
+              - '!presto-native-execution/presto_cpp/**'
   product-tests-specific-environment1:
     strategy:
       fail-fast: false
       matrix:
-        java: [17.0.15]
+        java: ['17']
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -98,7 +99,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        java: [17.0.15]
+        java: ['17']
     runs-on: ubuntu-latest
     permissions:
       contents: read

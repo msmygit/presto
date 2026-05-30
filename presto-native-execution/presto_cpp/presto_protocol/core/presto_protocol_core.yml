@@ -28,6 +28,9 @@ EnumMap:
   SampleNode:
     Type: SampleNodeType
 
+  RPCNode:
+    StreamingMode: RPCNodeStreamingMode
+
 ExtraFields:
   RowExpression:
     std::shared_ptr<SourceLocation>: sourceLocation
@@ -41,6 +44,10 @@ ExtraFields:
 
   RemoteTransactionHandle:
     Optional<String>: dummy
+
+UpdateFields:
+  RemoteSourceNode:
+    std::shared_ptr<TransportType>: transportType
 
 AbstractClasses:
   ColumnHandle:
@@ -172,13 +179,14 @@ AbstractClasses:
       - { name: TableWriterNode,          key: .TableWriterNode }
       - { name: TableWriterMergeNode,     key: com.facebook.presto.sql.planner.plan.TableWriterMergeNode }
       - { name: TopNNode,                 key: .TopNNode }
-      - { name: TopNRowNumberNode,        key: com.facebook.presto.sql.planner.plan.TopNRowNumberNode }
+      - { name: TopNRowNumberNode,        key: .TopNRowNumberNode }
       - { name: UnnestNode,               key: .UnnestNode }
       - { name: ValuesNode,               key: .ValuesNode }
       - { name: AssignUniqueId,           key: com.facebook.presto.sql.planner.plan.AssignUniqueId }
       - { name: MergeJoinNode,            key: .MergeJoinNode }
       - { name: WindowNode,               key: .WindowNode }
       - { name: CallDistributedProcedureNode, key: com.facebook.presto.sql.planner.plan.CallDistributedProcedureNode }
+      - { name: RPCNode,                key: com.facebook.presto.sql.planner.plan.RPCNode }
 
   RowExpression:
     super: JsonEncodedSubclass
@@ -249,7 +257,7 @@ JavaClasses:
   - presto-main-base/src/main/java/com/facebook/presto/sql/planner/plan/GroupIdNode.java
   - presto-main-base/src/main/java/com/facebook/presto/sql/planner/plan/RowNumberNode.java
   - presto-main-base/src/main/java/com/facebook/presto/sql/planner/plan/SampleNode.java
-  - presto-main-base/src/main/java/com/facebook/presto/sql/planner/plan/TopNRowNumberNode.java
+  - presto-spi/src/main/java/com/facebook/presto/spi/plan/TopNRowNumberNode.java
   - presto-spi/src/main/java/com/facebook/presto/spi/plan/TableWriterNode.java
   - presto-main-base/src/main/java/com/facebook/presto/sql/planner/plan/TableWriterMergeNode.java
   - presto-spi/src/main/java/com/facebook/presto/spi/plan/UnnestNode.java
@@ -293,6 +301,7 @@ JavaClasses:
   - presto-spi/src/main/java/com/facebook/presto/spi/plan/ProjectNode.java
   - presto-common/src/main/java/com/facebook/presto/common/predicate/Range.java
   - presto-main-base/src/main/java/com/facebook/presto/sql/planner/plan/RemoteSourceNode.java
+  - presto-main-base/src/main/java/com/facebook/presto/sql/planner/plan/TransportType.java
   - presto-spi/src/main/java/com/facebook/presto/spi/session/ResourceEstimates.java
   - presto-main-base/src/main/java/com/facebook/presto/execution/ScheduledSplit.java
   - presto-spi/src/main/java/com/facebook/presto/spi/SchemaTableName.java
@@ -340,6 +349,7 @@ JavaClasses:
   - presto-spi/src/main/java/com/facebook/presto/spi/plan/SortNode.java
   - presto-main-base/src/main/java/com/facebook/presto/sql/planner/plan/AssignUniqueId.java
   - presto-main-base/src/main/java/com/facebook/presto/sql/planner/plan/CallDistributedProcedureNode.java
+  - presto-main-base/src/main/java/com/facebook/presto/sql/planner/plan/RPCNode.java
   - presto-spi/src/main/java/com/facebook/presto/spi/SourceLocation.java
   - presto-spark-base/src/main/java/com/facebook/presto/spark/execution/http/BatchTaskUpdateRequest.java
   - presto-spi/src/main/java/com/facebook/presto/spi/plan/JoinType.java
@@ -364,3 +374,4 @@ JavaClasses:
   - presto-spi/src/main/java/com/facebook/presto/spi/NodeLoadMetrics.java
   - presto-spi/src/main/java/com/facebook/presto/spi/session/SessionPropertyMetadata.java
   - presto-native-sidecar-plugin/src/main/java/com/facebook/presto/sidecar/functionNamespace/NativeFunctionHandle.java
+  - presto-native-sidecar-plugin/src/main/java/com/facebook/presto/sidecar/expressions/ExpressionOptimizationRequest.java

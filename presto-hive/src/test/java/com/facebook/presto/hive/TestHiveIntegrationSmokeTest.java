@@ -30,6 +30,7 @@ import com.facebook.presto.spi.ConnectorSession;
 import com.facebook.presto.spi.TableHandle;
 import com.facebook.presto.spi.TableMetadata;
 import com.facebook.presto.spi.plan.MarkDistinctNode;
+import com.facebook.presto.spi.plan.TopNRowNumberNode;
 import com.facebook.presto.spi.plan.WindowNode;
 import com.facebook.presto.spi.security.Identity;
 import com.facebook.presto.spi.security.SelectedRole;
@@ -38,7 +39,6 @@ import com.facebook.presto.sql.planner.Plan;
 import com.facebook.presto.sql.planner.plan.ExchangeNode;
 import com.facebook.presto.sql.planner.plan.RowNumberNode;
 import com.facebook.presto.sql.planner.plan.TableWriterMergeNode;
-import com.facebook.presto.sql.planner.plan.TopNRowNumberNode;
 import com.facebook.presto.sql.planner.planPrinter.IOPlanPrinter.ColumnConstraint;
 import com.facebook.presto.sql.planner.planPrinter.IOPlanPrinter.FormattedDomain;
 import com.facebook.presto.sql.planner.planPrinter.IOPlanPrinter.FormattedMarker;
@@ -6237,6 +6237,121 @@ public class TestHiveIntegrationSmokeTest
     }
 
     @Test
+    public void testCtasFromMaterializedViewDataConsistency()
+    {
+        Session stitchingDisabledSession = Session.builder(getSession())
+                .setSystemProperty(MATERIALIZED_VIEW_DATA_CONSISTENCY_ENABLED, "false")
+                .build();
+        Session stitchingEnabledSession = Session.builder(getSession())
+                .setSystemProperty(MATERIALIZED_VIEW_DATA_CONSISTENCY_ENABLED, "true")
+                .build();
+
+        assertUpdate("CREATE TABLE mv_ctas_base (id BIGINT, partkey VARCHAR) " +
+                "WITH (partitioned_by=ARRAY['partkey'])");
+        assertUpdate("INSERT INTO mv_ctas_base VALUES (1, 'p1'), (2, 'p2'), (3, 'p1')", 3);
+
+        assertUpdate("CREATE MATERIALIZED VIEW mv_ctas " +
+                "WITH (partitioned_by=ARRAY['partkey']" + retentionDays(30) + ") " +
+                "AS SELECT id, partkey FROM mv_ctas_base");
+
+        try {
+            // CTAS from unrefreshed MV without stitching should produce empty data
+            assertUpdate(stitchingDisabledSession,
+                    "CREATE TABLE mv_ctas_no_stitch AS SELECT * FROM mv_ctas", 0);
+            assertQuery(stitchingDisabledSession,
+                    "SELECT COUNT(*) FROM mv_ctas_no_stitch", "SELECT 0");
+
+            // CTAS from unrefreshed MV with stitching should read from base table
+            assertUpdate(stitchingEnabledSession,
+                    "CREATE TABLE mv_ctas_stitch AS SELECT * FROM mv_ctas", 3);
+            assertQuery(stitchingEnabledSession,
+                    "SELECT * FROM mv_ctas_stitch ORDER BY id",
+                    "VALUES (1, 'p1'), (2, 'p2'), (3, 'p1')");
+
+            // After refreshing, CTAS should return data even without stitching
+            Session fullRefreshSession = Session.builder(getSession())
+                    .setSystemProperty(MATERIALIZED_VIEW_ALLOW_FULL_REFRESH_ENABLED, "true")
+                    .build();
+            assertUpdate(fullRefreshSession, "REFRESH MATERIALIZED VIEW mv_ctas", 3);
+
+            assertUpdate(stitchingDisabledSession,
+                    "CREATE TABLE mv_ctas_refreshed AS SELECT * FROM mv_ctas", 3);
+            assertQuery(stitchingDisabledSession,
+                    "SELECT * FROM mv_ctas_refreshed ORDER BY id",
+                    "VALUES (1, 'p1'), (2, 'p2'), (3, 'p1')");
+        }
+        finally {
+            getQueryRunner().execute("DROP TABLE IF EXISTS mv_ctas_no_stitch");
+            getQueryRunner().execute("DROP TABLE IF EXISTS mv_ctas_stitch");
+            getQueryRunner().execute("DROP TABLE IF EXISTS mv_ctas_refreshed");
+            getQueryRunner().execute("DROP MATERIALIZED VIEW IF EXISTS mv_ctas");
+            getQueryRunner().execute("DROP TABLE IF EXISTS mv_ctas_base");
+        }
+    }
+
+    @Test
+    public void testInsertFromMaterializedViewDataConsistency()
+    {
+        Session stitchingDisabledSession = Session.builder(getSession())
+                .setSystemProperty(MATERIALIZED_VIEW_DATA_CONSISTENCY_ENABLED, "false")
+                .build();
+        Session stitchingEnabledSession = Session.builder(getSession())
+                .setSystemProperty(MATERIALIZED_VIEW_DATA_CONSISTENCY_ENABLED, "true")
+                .build();
+
+        assertUpdate("CREATE TABLE mv_insert_base (id BIGINT, partkey VARCHAR) " +
+                "WITH (partitioned_by=ARRAY['partkey'])");
+        assertUpdate("INSERT INTO mv_insert_base VALUES (1, 'p1'), (2, 'p2'), (3, 'p1')", 3);
+
+        assertUpdate("CREATE MATERIALIZED VIEW mv_insert " +
+                "WITH (partitioned_by=ARRAY['partkey']" + retentionDays(30) + ") " +
+                "AS SELECT id, partkey FROM mv_insert_base");
+
+        try {
+            // INSERT from unrefreshed MV without stitching should produce empty data
+            assertUpdate(stitchingDisabledSession,
+                    "CREATE TABLE mv_insert_no_stitch (id BIGINT, partkey VARCHAR) " +
+                            "WITH (partitioned_by=ARRAY['partkey'])");
+            assertUpdate(stitchingDisabledSession,
+                    "INSERT INTO mv_insert_no_stitch SELECT * FROM mv_insert", 0);
+            assertQuery(stitchingDisabledSession,
+                    "SELECT COUNT(*) FROM mv_insert_no_stitch", "SELECT 0");
+
+            // INSERT from unrefreshed MV with stitching should read from base table
+            assertUpdate(stitchingEnabledSession,
+                    "CREATE TABLE mv_insert_stitch (id BIGINT, partkey VARCHAR) " +
+                            "WITH (partitioned_by=ARRAY['partkey'])");
+            assertUpdate(stitchingEnabledSession,
+                    "INSERT INTO mv_insert_stitch SELECT * FROM mv_insert", 3);
+            assertQuery(stitchingEnabledSession,
+                    "SELECT * FROM mv_insert_stitch ORDER BY id",
+                    "VALUES (1, 'p1'), (2, 'p2'), (3, 'p1')");
+
+            // After refreshing, INSERT should return data even without stitching
+            Session fullRefreshSession = Session.builder(getSession())
+                    .setSystemProperty(MATERIALIZED_VIEW_ALLOW_FULL_REFRESH_ENABLED, "true")
+                    .build();
+            assertUpdate(fullRefreshSession, "REFRESH MATERIALIZED VIEW mv_insert", 3);
+
+            assertUpdate(stitchingDisabledSession,
+                    "CREATE TABLE mv_insert_refreshed (id BIGINT, partkey VARCHAR) " +
+                            "WITH (partitioned_by=ARRAY['partkey'])");
+            assertUpdate(stitchingDisabledSession,
+                    "INSERT INTO mv_insert_refreshed SELECT * FROM mv_insert", 3);
+            assertQuery(stitchingDisabledSession,
+                    "SELECT * FROM mv_insert_refreshed ORDER BY id",
+                    "VALUES (1, 'p1'), (2, 'p2'), (3, 'p1')");
+        }
+        finally {
+            getQueryRunner().execute("DROP TABLE IF EXISTS mv_insert_no_stitch");
+            getQueryRunner().execute("DROP TABLE IF EXISTS mv_insert_stitch");
+            getQueryRunner().execute("DROP TABLE IF EXISTS mv_insert_refreshed");
+            getQueryRunner().execute("DROP MATERIALIZED VIEW IF EXISTS mv_insert");
+            getQueryRunner().execute("DROP TABLE IF EXISTS mv_insert_base");
+        }
+    }
+
+    @Test
     public void testAlphaFormatDdl()
     {
         assertUpdate("CREATE TABLE test_alpha_ddl_table (col1 bigint) WITH (format = 'ALPHA')");
@@ -7088,6 +7203,157 @@ public class TestHiveIntegrationSmokeTest
                         .getMaterializedRows());
 
         assertUpdate("DROP TABLE csv_table_skip_header");
+    }
+
+    @Test
+    public void testSerdeParametersForTextfileRead()
+            throws Exception
+    {
+        File tempDir = createTempDir();
+        File dataFile = new File(tempDir, "custom-delim.txt");
+        Files.write(
+                "1001" +
+                "|he\u0001|llo" +
+                "|true" +
+                "|88.5" +
+                "|alpha;beta;gamma" +
+                "|size:large;color:blue" +
+                "|42;1.1:2.2:3.3;20\u0004bar:10\u0004foo\n", dataFile, UTF_8);
+
+        String catalog = getSession().getCatalog().get();
+        String schema = getSession().getSchema().get();
+        String table = "test_textfile_custom_delim_read";
+        String path = new Path(tempDir.toURI().toASCIIString()).toString();
+
+        String createTableWithCustomSerdeFormat =
+                "CREATE TABLE %s.%s.%s (\n" +
+                        "   %s bigint,\n" +
+                        "   %s varchar,\n" +
+                        "   %s boolean,\n" +
+                        "   %s double,\n" +
+                        "   %s array(varchar),\n" +
+                        "   %s map(varchar, varchar),\n" +
+                        "   %s row(%s integer, %s array(real), %s map(smallint, varchar))\n" +
+                        ")\n" +
+                        "WITH (\n" +
+                        "   external_location = '%s',\n" +
+                        "   format = 'TEXTFILE',\n" +
+                        "   textfile_collection_delim = ';',\n" +
+                        "   textfile_escape_delim = %s,\n" +
+                        "   textfile_field_delim = '|',\n" +
+                        "   textfile_mapkey_delim = ':'\n" +
+                        ")";
+
+        @Language("SQL") String createTableSql = format(
+                createTableWithCustomSerdeFormat,
+                catalog, schema, table,
+                "c1", "c2", "c3", "c4", "c5", "c6", "c7",
+                "s_int", "s_arr", "s_map",
+                path,
+                "'\u0001'");
+
+        String expectedCreateTableSql = format(
+                createTableWithCustomSerdeFormat,
+                catalog, schema, table,
+                "\"c1\"", "\"c2\"", "\"c3\"", "\"c4\"", "\"c5\"", "\"c6\"", "\"c7\"",
+                "\"s_int\"", "\"s_arr\"", "\"s_map\"",
+                path,
+                "U&'\\0001'");
+
+        try {
+            assertUpdate(createTableSql);
+
+            MaterializedResult actualCreateTableSql = computeActual(format("SHOW CREATE TABLE %s.%s.%s", catalog, schema, table));
+            assertEquals(actualCreateTableSql.getOnlyValue(), expectedCreateTableSql);
+
+            assertQuery(
+                    format(
+                            "SELECT\n" +
+                                    "c1, c2, c3, c4, c5, \n" +
+                                    "element_at(c6, 'size'), element_at(c6, 'color'), \n" +
+                                    "c7.s_arr, element_at(c7.s_map, 10), element_at(c7.s_map, 20) FROM %s.%s.%s", catalog, schema, table),
+                    "VALUES(" +
+                            "1001, 'he|llo', true, 88.5, \n" +
+                            "ARRAY['alpha', 'beta', 'gamma'], \n" +
+                            "'large', 'blue', \n" +
+                            "ARRAY[CAST(1.1 AS REAL), CAST(2.2 AS REAL), CAST(3.3 AS REAL)], 'foo', 'bar')");
+        }
+        finally {
+            assertUpdate(format("DROP TABLE IF EXISTS %s.%s.%s", catalog, schema, table));
+            deleteRecursively(tempDir.toPath(), ALLOW_INSECURE);
+        }
+    }
+
+    @Test
+    public void testSerdeParametersForTextfileWrite()
+    {
+        String catalog = getSession().getCatalog().get();
+        String schema = getSession().getSchema().get();
+        String table = "test_textfile_custom_delim_write";
+
+        String createTableWithCustomSerdeFormat =
+                "CREATE TABLE %s.%s.%s (\n" +
+                        "   %s bigint,\n" +
+                        "   %s varchar,\n" +
+                        "   %s boolean,\n" +
+                        "   %s double,\n" +
+                        "   %s array(varchar),\n" +
+                        "   %s map(varchar, varchar),\n" +
+                        "   %s row(%s integer, %s array(real), %s map(smallint, varchar))\n" +
+                        ")\n" +
+                        "WITH (\n" +
+                        "   format = 'TEXTFILE',\n" +
+                        "   textfile_collection_delim = ';',\n" +
+                        "   textfile_escape_delim = %s,\n" +
+                        "   textfile_field_delim = '|',\n" +
+                        "   textfile_mapkey_delim = ':'\n" +
+                        ")";
+
+        @Language("SQL") String createTableSql = format(
+                createTableWithCustomSerdeFormat,
+                catalog, schema, table,
+                "c1", "c2", "c3", "c4", "c5", "c6", "c7",
+                "s_int", "s_arr", "s_map",
+                "'\u0001'");
+
+        String expectedCreateTableSql = format(
+                createTableWithCustomSerdeFormat,
+                catalog, schema, table,
+                "\"c1\"", "\"c2\"", "\"c3\"", "\"c4\"", "\"c5\"", "\"c6\"", "\"c7\"",
+                "\"s_int\"", "\"s_arr\"", "\"s_map\"",
+                "U&'\\0001'");
+
+        try {
+            assertUpdate(createTableSql);
+
+            MaterializedResult actualCreateTableSql = computeActual(format("SHOW CREATE TABLE %s.%s.%s", catalog, schema, table));
+            assertEquals(actualCreateTableSql.getOnlyValue(), expectedCreateTableSql);
+
+            assertUpdate(format(
+                    "INSERT INTO %s.%s.%s VALUES (" +
+                            "1001, " +
+                            "'he|llo', " +
+                            "true, " +
+                            "88.5, " +
+                            "ARRAY['alpha','beta', 'gamma'], " +
+                            "MAP(ARRAY['size', 'color'], ARRAY['large', 'blue']), " +
+                            "ROW(42, ARRAY[REAL '1.1', REAL '2.2',REAL '3.3'], MAP(ARRAY[SMALLINT '10', SMALLINT '20'], ARRAY['foo', 'bar'])))", catalog, schema, table), 1);
+
+            assertQuery(
+                    format(
+                            "SELECT\n" +
+                                    "c1, c2, c3, c4, c5, \n" +
+                                    "element_at(c6, 'size'), element_at(c6, 'color'), \n" +
+                                    "c7.s_arr, element_at(c7.s_map, 10), element_at(c7.s_map, 20) FROM %s.%s.%s", catalog, schema, table),
+                    "VALUES(" +
+                            "1001, 'he|llo', true, 88.5, \n" +
+                            "ARRAY['alpha', 'beta', 'gamma'], \n" +
+                            "'large', 'blue', \n" +
+                            "ARRAY[CAST(1.1 AS REAL), CAST(2.2 AS REAL), CAST(3.3 AS REAL)], 'foo', 'bar')");
+        }
+        finally {
+            assertUpdate(format("DROP TABLE IF EXISTS %s.%s.%s", catalog, schema, table));
+        }
     }
 
     protected String retentionDays(int days)

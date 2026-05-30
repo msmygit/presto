@@ -31,11 +31,13 @@ import java.util.Set;
 
 import static com.facebook.presto.spi.security.AccessDeniedException.denyAddColumn;
 import static com.facebook.presto.spi.security.AccessDeniedException.denyAddConstraint;
+import static com.facebook.presto.spi.security.AccessDeniedException.denyAlterColumn;
 import static com.facebook.presto.spi.security.AccessDeniedException.denyCallProcedure;
 import static com.facebook.presto.spi.security.AccessDeniedException.denyCatalogAccess;
 import static com.facebook.presto.spi.security.AccessDeniedException.denyCreateBranch;
 import static com.facebook.presto.spi.security.AccessDeniedException.denyCreateSchema;
 import static com.facebook.presto.spi.security.AccessDeniedException.denyCreateTable;
+import static com.facebook.presto.spi.security.AccessDeniedException.denyCreateTag;
 import static com.facebook.presto.spi.security.AccessDeniedException.denyCreateView;
 import static com.facebook.presto.spi.security.AccessDeniedException.denyCreateViewWithSelect;
 import static com.facebook.presto.spi.security.AccessDeniedException.denyDeleteTable;
@@ -126,6 +128,16 @@ public interface SystemAccessControl
     default void checkCanDropSchema(Identity identity, AccessControlContext context, CatalogSchemaName schema)
     {
         denyDropSchema(schema.toString());
+    }
+
+    /**
+     * Check if identity is allowed to alter columns for the specified table in a catalog.
+     *
+     * @throws AccessDeniedException if not allowed
+     */
+    default void checkCanAlterColumn(Identity identity, AccessControlContext context, CatalogSchemaTableName table)
+    {
+        denyAlterColumn(table.toString());
     }
 
     /**
@@ -422,6 +434,16 @@ public interface SystemAccessControl
     default void checkCanCreateBranch(Identity identity, AccessControlContext context, CatalogSchemaTableName table)
     {
         denyCreateBranch(table.toString());
+    }
+
+    /**
+     * Check if identity is allowed to create tag on the specified table in a catalog.
+     *
+     * @throws com.facebook.presto.spi.security.AccessDeniedException if not allowed
+     */
+    default void checkCanCreateTag(Identity identity, AccessControlContext context, CatalogSchemaTableName table)
+    {
+        denyCreateTag(table.toString());
     }
 
     /**

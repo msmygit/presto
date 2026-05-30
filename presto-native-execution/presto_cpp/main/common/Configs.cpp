@@ -40,9 +40,9 @@ std::string bool2String(bool value) {
 }
 
 uint32_t hardwareConcurrency() {
-  const auto numLogicalCores = folly::hardware_concurrency();
-  // The spec says folly::hardware_concurrency() might return 0.
-  // But we depend on folly::hardware_concurrency() to create executors.
+  const auto numLogicalCores = folly::available_concurrency();
+  // The spec says folly::available_concurrency() might return 0.
+  // But we depend on folly::available_concurrency() to create executors.
   // Check to ensure numThreads is > 0.
   VELOX_CHECK_GT(numLogicalCores, 0);
   return numLogicalCores;
@@ -183,6 +183,8 @@ SystemConfig::SystemConfig() {
               std::round(0.5 * hardwareConcurrency())),
           NUM_PROP(kSpillerNumCpuThreadsHwMultiplier, 1.0),
           STR_PROP(kSpillerFileCreateConfig, ""),
+          STR_PROP(kSpillerAggregationFileCreateConfig, ""),
+          STR_PROP(kSpillerHashJoinFileCreateConfig, ""),
           STR_PROP(kSpillerDirectoryCreateConfig, ""),
           NONE_PROP(kSpillerSpillPath),
           NUM_PROP(kShutdownOnsetSec, 10),
@@ -210,6 +212,7 @@ SystemConfig::SystemConfig() {
           NUM_PROP(kAsyncCacheSsdSavableRatio, 0.125),
           NUM_PROP(kAsyncCacheMinSsdSavableBytes, 1 << 24 /*16MB*/),
           NUM_PROP(kAsyncCacheNumShards, 4),
+          NUM_PROP(kAsyncCacheSsdFlushThresholdBytes, 0),
           STR_PROP(kAsyncCachePersistenceInterval, "0s"),
           BOOL_PROP(kAsyncCacheSsdDisableFileCow, false),
           BOOL_PROP(kSsdCacheChecksumEnabled, false),
@@ -228,8 +231,17 @@ SystemConfig::SystemConfig() {
           NUM_PROP(kLargestSizeClassPages, 256),
           BOOL_PROP(kEnableVeloxTaskLogging, false),
           BOOL_PROP(kEnableVeloxExprSetLogging, false),
-          NUM_PROP(kLocalShuffleMaxPartitionBytes, 268435456),
+          NUM_PROP(kLocalShuffleMaxPartitionBytes, 65536),
           STR_PROP(kShuffleName, ""),
+          BOOL_PROP(kExchangeMaterializationEnabled, false),
+          NUM_PROP(
+              kExchangeMaterializationPartitioningRowBatchBufferSize,
+              16L << 20),
+          NUM_PROP(kExchangeMaterializationOutputBufferMaxBytes, 1L << 30),
+          NUM_PROP(
+              kExchangeMaterializationOutputBufferPerPartitionMaxBytes,
+              130L * 1024),
+          NUM_PROP(kExchangeMaterializationReclaimDrainThresholdRatio, 0.67),
           STR_PROP(kRemoteFunctionServerCatalogName, ""),
           STR_PROP(kRemoteFunctionServerSerde, "presto_page"),
           BOOL_PROP(kHttpEnableAccessLog, false),
@@ -279,6 +291,7 @@ SystemConfig::SystemConfig() {
           BOOL_PROP(kAggregationSpillEnabled, true),
           BOOL_PROP(kOrderBySpillEnabled, true),
           NUM_PROP(kMaxSpillBytes, 100UL << 30), // 100GB
+          NUM_PROP(kBroadcastExchangeSourceReadBufferBytes, 1 << 20), // 1MB
           BOOL_PROP(kBroadcastJoinTableCachingEnabled, false),
           BOOL_PROP(kExchangeLazyFetchingEnabled, false),
           NUM_PROP(kRequestDataSizesMaxWaitSec, 10),
@@ -450,6 +463,11 @@ bool SystemConfig::orderBySpillEnabled() const {
   return optionalProperty<bool>(kOrderBySpillEnabled).value();
 }
 
+uint64_t SystemConfig::broadcastExchangeSourceReadBufferBytes() const {
+  return optionalProperty<uint64_t>(kBroadcastExchangeSourceReadBufferBytes)
+      .value();
+}
+
 bool SystemConfig::broadcastJoinTableCachingEnabled() const {
   return optionalProperty<bool>(kBroadcastJoinTableCachingEnabled).value();
 }
@@ -603,6 +621,16 @@ std::string SystemConfig::spillerFileCreateConfig() const {
   return optionalProperty<std::string>(kSpillerFileCreateConfig).value();
 }
 
+std::string SystemConfig::spillerAggregationFileCreateConfig() const {
+  return optionalProperty<std::string>(kSpillerAggregationFileCreateConfig)
+      .value();
+}
+
+std::string SystemConfig::spillerHashJoinFileCreateConfig() const {
+  return optionalProperty<std::string>(kSpillerHashJoinFileCreateConfig)
+      .value();
+}
+
 std::string SystemConfig::spillerDirectoryCreateConfig() const {
   return optionalProperty<std::string>(kSpillerDirectoryCreateConfig).value();
 }
@@ -719,6 +747,10 @@ int32_t SystemConfig::asyncCacheNumShards() const {
   return optionalProperty<int32_t>(kAsyncCacheNumShards).value();
 }
 
+uint64_t SystemConfig::asyncCacheSsdFlushThresholdBytes() const {
+  return optionalProperty<uint64_t>(kAsyncCacheSsdFlushThresholdBytes).value();
+}
+
 std::chrono::duration<double> SystemConfig::asyncCachePersistenceInterval()
     const {
   return velox::config::toDuration(
@@ -743,6 +775,36 @@ uint64_t SystemConfig::ssdCacheMaxEntries() const {
 
 std::string SystemConfig::shuffleName() const {
   return optionalProperty(kShuffleName).value();
+}
+
+bool SystemConfig::exchangeMaterializationEnabled() const {
+  return optionalProperty<bool>(kExchangeMaterializationEnabled)
+      .value_or(false);
+}
+
+int64_t SystemConfig::exchangeMaterializationPartitioningRowBatchBufferSize()
+    const {
+  return optionalProperty<int64_t>(
+             kExchangeMaterializationPartitioningRowBatchBufferSize)
+      .value_or(16L << 20);
+}
+
+int64_t SystemConfig::exchangeMaterializationOutputBufferMaxBytes() const {
+  return optionalProperty<int64_t>(kExchangeMaterializationOutputBufferMaxBytes)
+      .value_or(1L << 30);
+}
+
+int64_t SystemConfig::exchangeMaterializationOutputBufferPerPartitionMaxBytes()
+    const {
+  return optionalProperty<int64_t>(
+             kExchangeMaterializationOutputBufferPerPartitionMaxBytes)
+      .value_or(130L * 1024);
+}
+
+double SystemConfig::exchangeMaterializationReclaimDrainThresholdRatio() const {
+  return optionalProperty<double>(
+             kExchangeMaterializationReclaimDrainThresholdRatio)
+      .value_or(0.67);
 }
 
 bool SystemConfig::enableSerializedPageChecksum() const {

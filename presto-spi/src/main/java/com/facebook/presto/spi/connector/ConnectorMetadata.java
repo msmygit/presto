@@ -417,6 +417,15 @@ public interface ConnectorMetadata
     }
 
     /**
+     * Set the default value for the specified column for future writes.
+     * The exact semantics are connector-defined.
+     */
+    default void setColumnDefault(ConnectorSession session, ConnectorTableHandle tableHandle, String columnName, Object defaultValue)
+    {
+        throw new PrestoException(NOT_SUPPORTED, "This connector does not support setting column defaults");
+    }
+
+    /**
      * Drop the specified column
      */
     default void dropColumn(ConnectorSession session, ConnectorTableHandle tableHandle, ColumnHandle column)
@@ -452,6 +461,14 @@ public interface ConnectorMetadata
                 .collect(toList());
 
         return Optional.of(new ConnectorNewTableLayout(partitioningHandle, partitionColumns));
+    }
+
+    /**
+     * Set the specified column type
+     */
+    default void setColumnType(ConnectorSession session, ConnectorTableHandle tableHandle, ColumnHandle column, Type type)
+    {
+        throw new PrestoException(NOT_SUPPORTED, "This connector does not support setting column types");
     }
 
     /**
@@ -500,6 +517,22 @@ public interface ConnectorMetadata
     default Optional<ConnectorOutputMetadata> finishCreateTable(ConnectorSession session, ConnectorOutputTableHandle tableHandle, Collection<Slice> fragments, Collection<ComputedStatistics> computedStatistics)
     {
         throw new PrestoException(GENERIC_INTERNAL_ERROR, "ConnectorMetadata beginCreateTable() is implemented without finishCreateTable()");
+    }
+
+    /**
+     * Begin the atomic creation of a vector index with data.
+     */
+    default ConnectorOutputTableHandle beginCreateVectorIndex(ConnectorSession session, ConnectorTableMetadata indexMetadata, Optional<ConnectorNewTableLayout> layout, SchemaTableName sourceTableName)
+    {
+        throw new PrestoException(NOT_SUPPORTED, "This connector does not support creating vector indexes");
+    }
+
+    /**
+     * Finish a vector index creation with data after the data is written.
+     */
+    default Optional<ConnectorOutputMetadata> finishCreateVectorIndex(ConnectorSession session, ConnectorOutputTableHandle tableHandle, Collection<Slice> fragments, Collection<ComputedStatistics> computedStatistics)
+    {
+        throw new PrestoException(NOT_SUPPORTED, "This connector does not support creating vector indexes");
     }
 
     /**
@@ -768,6 +801,14 @@ public interface ConnectorMetadata
     }
 
     /**
+     * Set properties on the specified materialized view.
+     */
+    default void setMaterializedViewProperties(ConnectorSession session, SchemaTableName viewName, Map<String, Object> properties)
+    {
+        throw new PrestoException(NOT_SUPPORTED, "This connector does not support setting materialized view properties");
+    }
+
+    /**
      * Get the materialized view status to inform the engine how much data has been materialized in the view
      *
      * @param baseQueryDomain The domain from which to consider missing partitions. For example, a query that
@@ -983,6 +1024,21 @@ public interface ConnectorMetadata
             Optional<Long> maxSnapshotAgeDays)
     {
         throw new PrestoException(NOT_SUPPORTED, "This connector does not support creating table branches");
+    }
+
+    /**
+     * Create a tag for the specified table
+     */
+    default void createTag(
+            ConnectorSession session,
+            ConnectorTableHandle tableHandle,
+            String tagName,
+            boolean replace,
+            boolean ifNotExists,
+            Optional<ConnectorTableVersion> tableVersion,
+            Optional<Long> retainDays)
+    {
+        throw new PrestoException(NOT_SUPPORTED, "This connector does not support creating table tags");
     }
 
     /**

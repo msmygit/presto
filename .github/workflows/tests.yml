@@ -28,6 +28,7 @@ jobs:
           filters: |
             codechange:
               - '!presto-docs/**'
+              - '!presto-native-execution/presto_cpp/**'
 
   test:
     runs-on: ubuntu-latest
@@ -37,7 +38,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        java: [17.0.15]
+        java: ['17']
         modules:
           - :presto-tests -P presto-tests-execution-memory
           - :presto-tests -P presto-tests-general
@@ -63,6 +64,7 @@ jobs:
           - :presto-mongodb -P ci-full-tests
           - :presto-redis -P ci-full-tests
           - :presto-elasticsearch
+          - :presto-oracle -P ci
           - :presto-orc
           - :presto-thrift-connector
           - :presto-spark-base -P presto-spark-tests-smoke

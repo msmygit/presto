@@ -19,7 +19,10 @@ import com.facebook.airlift.units.Duration;
 import com.facebook.presto.common.QualifiedObjectName;
 import com.facebook.presto.common.RuntimeStats;
 import com.facebook.presto.common.Subfield;
+import com.facebook.presto.common.predicate.Domain;
+import com.facebook.presto.common.predicate.Range;
 import com.facebook.presto.common.predicate.TupleDomain;
+import com.facebook.presto.common.predicate.ValueSet;
 import com.facebook.presto.common.type.BigintType;
 import com.facebook.presto.common.type.SqlTimestampWithTimeZone;
 import com.facebook.presto.common.type.TimestampType;
@@ -34,7 +37,10 @@ import com.facebook.presto.hive.PartitionSet;
 import com.facebook.presto.hive.UnknownTableTypeException;
 import com.facebook.presto.iceberg.changelog.ChangelogOperation;
 import com.facebook.presto.iceberg.changelog.ChangelogUtil;
+import com.facebook.presto.iceberg.procedure.context.IcebergCommonProcedureContext;
 import com.facebook.presto.iceberg.statistics.StatisticsFileCache;
+import com.facebook.presto.iceberg.transaction.IcebergTransactionContext;
+import com.facebook.presto.iceberg.transaction.IcebergTransactionMetadata;
 import com.facebook.presto.spi.ColumnHandle;
 import com.facebook.presto.spi.ColumnMetadata;
 import com.facebook.presto.spi.ConnectorDeleteTableHandle;
@@ -64,11 +70,12 @@ import com.facebook.presto.spi.SchemaTableName;
 import com.facebook.presto.spi.SchemaTablePrefix;
 import com.facebook.presto.spi.SystemTable;
 import com.facebook.presto.spi.TableNotFoundException;
-import com.facebook.presto.spi.connector.ConnectorMetadata;
+import com.facebook.presto.spi.connector.ConnectorCommitHandle;
 import com.facebook.presto.spi.connector.ConnectorOutputMetadata;
 import com.facebook.presto.spi.connector.ConnectorTableVersion;
 import com.facebook.presto.spi.connector.ConnectorTableVersion.VersionOperator;
 import com.facebook.presto.spi.connector.ConnectorTableVersion.VersionType;
+import com.facebook.presto.spi.connector.EmptyConnectorCommitHandle;
 import com.facebook.presto.spi.connector.RowChangeParadigm;
 import com.facebook.presto.spi.function.StandardFunctionResolution;
 import com.facebook.presto.spi.plan.FilterStatsCalculatorService;
@@ -99,25 +106,37 @@ import org.apache.iceberg.DataFiles;
 import org.apache.iceberg.DeleteFiles;
 import org.apache.iceberg.FileFormat;
 import org.apache.iceberg.FileMetadata;
-import org.apache.iceberg.IsolationLevel;
+import org.apache.iceberg.FileScanTask;
+import org.apache.iceberg.IncrementalAppendScan;
 import org.apache.iceberg.ManageSnapshots;
+import org.apache.iceberg.ManifestFile;
 import org.apache.iceberg.MetadataColumns;
 import org.apache.iceberg.MetricsConfig;
 import org.apache.iceberg.MetricsModes.None;
+import org.apache.iceberg.OverwriteFiles;
+import org.apache.iceberg.PartitionField;
 import org.apache.iceberg.PartitionSpec;
+import org.apache.iceberg.ReplacePartitions;
 import org.apache.iceberg.RowDelta;
 import org.apache.iceberg.RowLevelOperationMode;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.SchemaParser;
 import org.apache.iceberg.Snapshot;
+import org.apache.iceberg.SnapshotUpdate;
 import org.apache.iceberg.SortOrder;
+import org.apache.iceberg.StructLike;
 import org.apache.iceberg.Table;
+import org.apache.iceberg.TableMetadata;
 import org.apache.iceberg.TableProperties;
 import org.apache.iceberg.Transaction;
 import org.apache.iceberg.UpdatePartitionSpec;
 import org.apache.iceberg.UpdateProperties;
+import org.apache.iceberg.UpdateSchema;
 import org.apache.iceberg.exceptions.NoSuchTableException;
 import org.apache.iceberg.exceptions.ValidationException;
+import org.apache.iceberg.expressions.Expressions;
+import org.apache.iceberg.expressions.Literal;
+import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.types.Type;
 import org.apache.iceberg.types.TypeUtil;
 import org.apache.iceberg.types.Types;
@@ -126,20 +145,23 @@ import org.apache.iceberg.types.Types.StringType;
 import org.apache.iceberg.util.CharSequenceSet;
 import org.apache.iceberg.view.View;
 
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.OptionalInt;
 import java.util.OptionalLong;
 import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
 import java.util.stream.StreamSupport;
@@ -160,17 +182,25 @@ import static com.facebook.presto.iceberg.IcebergColumnHandle.DELETE_FILE_PATH_C
 import static com.facebook.presto.iceberg.IcebergColumnHandle.DELETE_FILE_PATH_COLUMN_METADATA;
 import static com.facebook.presto.iceberg.IcebergColumnHandle.IS_DELETED_COLUMN_HANDLE;
 import static com.facebook.presto.iceberg.IcebergColumnHandle.IS_DELETED_COLUMN_METADATA;
+import static com.facebook.presto.iceberg.IcebergColumnHandle.LAST_UPDATED_SEQUENCE_NUMBER_COLUMN_HANDLE;
+import static com.facebook.presto.iceberg.IcebergColumnHandle.LAST_UPDATED_SEQUENCE_NUMBER_COLUMN_METADATA;
 import static com.facebook.presto.iceberg.IcebergColumnHandle.PATH_COLUMN_HANDLE;
 import static com.facebook.presto.iceberg.IcebergColumnHandle.PATH_COLUMN_METADATA;
+import static com.facebook.presto.iceberg.IcebergColumnHandle.ROW_ID_COLUMN_HANDLE;
+import static com.facebook.presto.iceberg.IcebergColumnHandle.ROW_ID_COLUMN_METADATA;
 import static com.facebook.presto.iceberg.IcebergErrorCode.ICEBERG_COMMIT_ERROR;
+import static com.facebook.presto.iceberg.IcebergErrorCode.ICEBERG_INCOMPATIBLE_COLUMN_TYPE;
 import static com.facebook.presto.iceberg.IcebergErrorCode.ICEBERG_INVALID_FORMAT_VERSION;
 import static com.facebook.presto.iceberg.IcebergErrorCode.ICEBERG_INVALID_MATERIALIZED_VIEW;
 import static com.facebook.presto.iceberg.IcebergErrorCode.ICEBERG_INVALID_SNAPSHOT_ID;
+import static com.facebook.presto.iceberg.IcebergErrorCode.ICEBERG_TRANSACTION_CONFLICT_ERROR;
+import static com.facebook.presto.iceberg.IcebergMaterializedViewProperties.getMaxSnapshotsPerRefresh;
 import static com.facebook.presto.iceberg.IcebergMaterializedViewProperties.getRefreshType;
 import static com.facebook.presto.iceberg.IcebergMaterializedViewProperties.getStaleReadBehavior;
 import static com.facebook.presto.iceberg.IcebergMaterializedViewProperties.getStalenessWindow;
 import static com.facebook.presto.iceberg.IcebergMaterializedViewProperties.getStorageSchema;
 import static com.facebook.presto.iceberg.IcebergMaterializedViewProperties.getStorageTable;
+import static com.facebook.presto.iceberg.IcebergMaterializedViewProperties.serializeForUpdate;
 import static com.facebook.presto.iceberg.IcebergMetadataColumn.DATA_SEQUENCE_NUMBER;
 import static com.facebook.presto.iceberg.IcebergMetadataColumn.DELETE_FILE_PATH;
 import static com.facebook.presto.iceberg.IcebergMetadataColumn.FILE_PATH;
@@ -180,6 +210,9 @@ import static com.facebook.presto.iceberg.IcebergMetadataColumn.MERGE_TARGET_ROW
 import static com.facebook.presto.iceberg.IcebergMetadataColumn.UPDATE_ROW_DATA;
 import static com.facebook.presto.iceberg.IcebergPartitionType.ALL;
 import static com.facebook.presto.iceberg.IcebergSessionProperties.getCompressionCodec;
+import static com.facebook.presto.iceberg.IcebergSessionProperties.getMaterializedViewDefaultMaxSnapshotsPerRefresh;
+import static com.facebook.presto.iceberg.IcebergSessionProperties.getMaterializedViewDefaultStorageSchema;
+import static com.facebook.presto.iceberg.IcebergSessionProperties.getMaterializedViewMaxChangedPartitions;
 import static com.facebook.presto.iceberg.IcebergSessionProperties.getMaterializedViewStoragePrefix;
 import static com.facebook.presto.iceberg.IcebergSessionProperties.isPushdownFilterEnabled;
 import static com.facebook.presto.iceberg.IcebergTableProperties.LOCATION_PROPERTY;
@@ -188,7 +221,11 @@ import static com.facebook.presto.iceberg.IcebergTableProperties.SORTED_BY_PROPE
 import static com.facebook.presto.iceberg.IcebergTableType.CHANGELOG;
 import static com.facebook.presto.iceberg.IcebergTableType.DATA;
 import static com.facebook.presto.iceberg.IcebergTableType.EQUALITY_DELETES;
+import static com.facebook.presto.iceberg.IcebergUtil.MAX_FORMAT_VERSION_FOR_ROW_LEVEL_OPERATIONS;
 import static com.facebook.presto.iceberg.IcebergUtil.MIN_FORMAT_VERSION_FOR_DELETE;
+import static com.facebook.presto.iceberg.IcebergUtil.MIN_FORMAT_VERSION_FOR_ROW_LINEAGE;
+import static com.facebook.presto.iceberg.IcebergUtil.convertToIcebergLiteral;
+import static com.facebook.presto.iceberg.IcebergUtil.createDomainFromIcebergPartitionValue;
 import static com.facebook.presto.iceberg.IcebergUtil.getColumns;
 import static com.facebook.presto.iceberg.IcebergUtil.getColumnsForWrite;
 import static com.facebook.presto.iceberg.IcebergUtil.getDeleteMode;
@@ -200,12 +237,19 @@ import static com.facebook.presto.iceberg.IcebergUtil.getPartitions;
 import static com.facebook.presto.iceberg.IcebergUtil.getSnapshotIdTimeOperator;
 import static com.facebook.presto.iceberg.IcebergUtil.getSortFields;
 import static com.facebook.presto.iceberg.IcebergUtil.getTableComment;
+import static com.facebook.presto.iceberg.IcebergUtil.opsFromTable;
 import static com.facebook.presto.iceberg.IcebergUtil.resolveSnapshotIdByName;
+import static com.facebook.presto.iceberg.IcebergUtil.supportsRowLineage;
 import static com.facebook.presto.iceberg.IcebergUtil.toHiveColumns;
 import static com.facebook.presto.iceberg.IcebergUtil.tryGetLocation;
 import static com.facebook.presto.iceberg.IcebergUtil.tryGetProperties;
 import static com.facebook.presto.iceberg.IcebergUtil.tryGetSchema;
+import static com.facebook.presto.iceberg.IcebergUtil.validateBranchExists;
+import static com.facebook.presto.iceberg.IcebergUtil.validateMinimumFormatVersion;
+import static com.facebook.presto.iceberg.IcebergUtil.validateNoBranchInBaseTables;
+import static com.facebook.presto.iceberg.IcebergUtil.validateNoBranchSpecified;
 import static com.facebook.presto.iceberg.IcebergUtil.validateTableMode;
+import static com.facebook.presto.iceberg.IcebergWarningCode.BOUNDED_REFRESH_IGNORED;
 import static com.facebook.presto.iceberg.IcebergWarningCode.SORT_COLUMN_TRANSFORM_NOT_SUPPORTED_WARNING;
 import static com.facebook.presto.iceberg.IcebergWarningCode.USE_OF_DEPRECATED_TABLE_PROPERTY;
 import static com.facebook.presto.iceberg.PartitionFields.getPartitionColumnName;
@@ -229,35 +273,40 @@ import static com.facebook.presto.spi.MaterializedViewStatus.MaterializedViewSta
 import static com.facebook.presto.spi.MaterializedViewStatus.MaterializedViewState.NOT_MATERIALIZED;
 import static com.facebook.presto.spi.MaterializedViewStatus.MaterializedViewState.PARTIALLY_MATERIALIZED;
 import static com.facebook.presto.spi.StandardErrorCode.ALREADY_EXISTS;
+import static com.facebook.presto.spi.StandardErrorCode.COLUMN_NOT_FOUND;
 import static com.facebook.presto.spi.StandardErrorCode.INVALID_VIEW;
 import static com.facebook.presto.spi.StandardErrorCode.NOT_FOUND;
 import static com.facebook.presto.spi.StandardErrorCode.NOT_SUPPORTED;
 import static com.facebook.presto.spi.connector.RowChangeParadigm.DELETE_ROW_AND_INSERT_ROW;
 import static com.facebook.presto.spi.statistics.TableStatisticType.ROW_COUNT;
+import static com.facebook.presto.spi.transaction.IsolationLevel.SERIALIZABLE;
+import static com.google.common.base.MoreObjects.firstNonNull;
 import static com.google.common.base.Strings.isNullOrEmpty;
 import static com.google.common.base.Verify.verify;
 import static com.google.common.collect.ImmutableList.toImmutableList;
 import static com.google.common.collect.ImmutableMap.toImmutableMap;
 import static com.google.common.collect.ImmutableSet.toImmutableSet;
 import static com.google.common.collect.Maps.transformValues;
+import static java.lang.Integer.parseInt;
 import static java.lang.Long.parseLong;
 import static java.lang.String.format;
 import static java.time.Duration.ofDays;
 import static java.util.Collections.singletonList;
 import static java.util.Objects.requireNonNull;
+import static org.apache.iceberg.DataOperations.APPEND;
+import static org.apache.iceberg.DataOperations.REPLACE;
 import static org.apache.iceberg.MetadataColumns.ROW_POSITION;
 import static org.apache.iceberg.MetadataColumns.SPEC_ID;
 import static org.apache.iceberg.RowLevelOperationMode.MERGE_ON_READ;
 import static org.apache.iceberg.SnapshotSummary.DELETED_RECORDS_PROP;
 import static org.apache.iceberg.SnapshotSummary.REMOVED_EQ_DELETES_PROP;
 import static org.apache.iceberg.SnapshotSummary.REMOVED_POS_DELETES_PROP;
-import static org.apache.iceberg.TableProperties.DELETE_ISOLATION_LEVEL;
-import static org.apache.iceberg.TableProperties.DELETE_ISOLATION_LEVEL_DEFAULT;
 import static org.apache.iceberg.TableProperties.WRITE_DATA_LOCATION;
-import static org.apache.iceberg.expressions.Expressions.alwaysTrue;
+import static org.apache.iceberg.util.SnapshotUtil.ancestorIdsBetween;
+import static org.apache.iceberg.util.SnapshotUtil.isAncestorOf;
 
 public abstract class IcebergAbstractMetadata
-        implements ConnectorMetadata
+        implements IcebergTransactionMetadata
 {
     private static final Logger log = Logger.get(IcebergAbstractMetadata.class);
     protected static final String INFORMATION_SCHEMA = "information_schema";
@@ -276,6 +325,7 @@ public abstract class IcebergAbstractMetadata
     protected static final String PRESTO_MATERIALIZED_VIEW_STALE_READ_BEHAVIOR = "presto.materialized_view.stale_read_behavior";
     protected static final String PRESTO_MATERIALIZED_VIEW_STALENESS_WINDOW = "presto.materialized_view.staleness_window";
     protected static final String PRESTO_MATERIALIZED_VIEW_REFRESH_TYPE = "presto.materialized_view.refresh_type";
+    protected static final String PRESTO_MATERIALIZED_VIEW_MAX_SNAPSHOTS_PER_REFRESH = "presto.materialized_view.max_snapshots_per_refresh";
 
     protected static final int CURRENT_MATERIALIZED_VIEW_FORMAT_VERSION = 1;
 
@@ -287,13 +337,11 @@ public abstract class IcebergAbstractMetadata
     protected final NodeVersion nodeVersion;
     protected final RowExpressionService rowExpressionService;
     protected final FilterStatsCalculatorService filterStatsCalculatorService;
-    protected Optional<IcebergProcedureContext> procedureContext = Optional.empty();
-    protected Transaction transaction;
+    protected final AtomicReference<IcebergCommonProcedureContext> procedureContext = new AtomicReference<>();
+    protected final IcebergTransactionContext transactionContext;
     protected final StatisticsFileCache statisticsFileCache;
     protected final IcebergTableProperties tableProperties;
-
     private final StandardFunctionResolution functionResolution;
-    private final ConcurrentMap<SchemaTableName, Table> icebergTables = new ConcurrentHashMap<>();
 
     public IcebergAbstractMetadata(
             TypeManager typeManager,
@@ -306,7 +354,9 @@ public abstract class IcebergAbstractMetadata
             NodeVersion nodeVersion,
             FilterStatsCalculatorService filterStatsCalculatorService,
             StatisticsFileCache statisticsFileCache,
-            IcebergTableProperties tableProperties)
+            IcebergTableProperties tableProperties,
+            com.facebook.presto.spi.transaction.IsolationLevel isolationLevel,
+            boolean autoCommitContext)
     {
         this.typeManager = requireNonNull(typeManager, "typeManager is null");
         this.procedureRegistry = requireNonNull(procedureRegistry, "procedureRegistry is null");
@@ -319,13 +369,12 @@ public abstract class IcebergAbstractMetadata
         this.filterStatsCalculatorService = requireNonNull(filterStatsCalculatorService, "filterStatsCalculatorService is null");
         this.statisticsFileCache = requireNonNull(statisticsFileCache, "statisticsFileCache is null");
         this.tableProperties = requireNonNull(tableProperties, "tableProperties is null");
+        this.transactionContext = new IcebergTransactionContext(isolationLevel, autoCommitContext);
     }
 
     protected final Table getIcebergTable(ConnectorSession session, SchemaTableName schemaTableName)
     {
-        return icebergTables.computeIfAbsent(
-                schemaTableName,
-                ignored -> getRawIcebergTable(session, schemaTableName));
+        return this.transactionContext.getIcebergTable(schemaTableName, ignored -> getRawIcebergTable(session, schemaTableName));
     }
 
     protected abstract Table getRawIcebergTable(ConnectorSession session, SchemaTableName schemaTableName);
@@ -352,9 +401,44 @@ public abstract class IcebergAbstractMetadata
 
     public abstract void unregisterTable(ConnectorSession clientSession, SchemaTableName schemaTableName);
 
-    public Optional<IcebergProcedureContext> getProcedureContext()
+    public Optional<IcebergCommonProcedureContext> getProcedureContext()
     {
-        return this.procedureContext;
+        return Optional.ofNullable(this.procedureContext.get());
+    }
+
+    protected static void validateTableForPresto(BaseTable table, Optional<Long> tableSnapshotId)
+    {
+        Snapshot snapshot;
+        try {
+            snapshot = tableSnapshotId
+                    .map(table::snapshot)
+                    .orElse(table.currentSnapshot());
+        }
+        catch (RuntimeException e) {
+            // If the snapshot cannot be retrieved (e.g. metadata is missing), we cannot validate the table.
+            // Returning here allows operations that do not strictly require the snapshot (like DROP TABLE) to proceed.
+            return;
+        }
+
+        if (snapshot == null) {
+            // empty table, nothing to validate
+            return;
+        }
+
+        TableMetadata metadata = table.operations().current();
+        if (metadata.formatVersion() < MIN_FORMAT_VERSION_FOR_ROW_LINEAGE) {
+            return;
+        }
+
+        Schema schema = metadata.schemasById().get(snapshot.schemaId());
+        if (schema == null) {
+            schema = metadata.schema();
+        }
+
+        // Reject Iceberg table encryption
+        if (!metadata.encryptionKeys().isEmpty() || snapshot.keyId() != null || metadata.properties().containsKey("encryption.key-id")) {
+            throw new PrestoException(NOT_SUPPORTED, "Iceberg table encryption is not supported");
+        }
     }
 
     /**
@@ -543,6 +627,8 @@ public abstract class IcebergAbstractMetadata
                 columns.add(DATA_SEQUENCE_NUMBER_COLUMN_METADATA);
                 columns.add(IS_DELETED_COLUMN_METADATA);
                 columns.add(DELETE_FILE_PATH_COLUMN_METADATA);
+                columns.add(ROW_ID_COLUMN_METADATA);
+                columns.add(LAST_UPDATED_SEQUENCE_NUMBER_COLUMN_METADATA);
             }
             return new ConnectorTableMetadata(table, columns.build(), createMetadataProperties(icebergTable, session), getTableComment(icebergTable));
         }
@@ -594,6 +680,7 @@ public abstract class IcebergAbstractMetadata
     @Override
     public void createTable(ConnectorSession session, ConnectorTableMetadata tableMetadata, boolean ignoreExisting)
     {
+        shouldRunInAutoCommitTransaction("CREATE TABLE");
         Optional<ConnectorNewTableLayout> layout = getNewTableLayout(session, tableMetadata);
         finishCreateTable(session, beginCreateTable(session, tableMetadata, layout), ImmutableList.of(), ImmutableList.of());
     }
@@ -606,8 +693,7 @@ public abstract class IcebergAbstractMetadata
 
     protected ConnectorInsertTableHandle beginIcebergTableInsert(ConnectorSession session, IcebergTableHandle table, Table icebergTable)
     {
-        transaction = icebergTable.newTransaction();
-
+        validateBranchExists(table, icebergTable);
         return new IcebergInsertTableHandle(
                 table.getSchemaName(),
                 table.getIcebergTableName(),
@@ -655,7 +741,7 @@ public abstract class IcebergAbstractMetadata
     private Optional<ConnectorOutputMetadata> finishInsert(ConnectorSession session, IcebergWritableTableHandle writableTableHandle, Collection<Slice> fragments)
     {
         if (fragments.isEmpty()) {
-            transaction.commitTransaction();
+            transactionContext.commit();
             return Optional.empty();
         }
 
@@ -663,16 +749,18 @@ public abstract class IcebergAbstractMetadata
                 .map(slice -> commitTaskCodec.fromJson(slice.getBytes()))
                 .collect(toImmutableList());
 
-        Table icebergTable = transaction.table();
-        AppendFiles appendFiles = transaction.newAppend();
-
         ImmutableSet.Builder<String> writtenFiles = ImmutableSet.builder();
-        commitTasks.forEach(task -> handleInsertTask(task, icebergTable, appendFiles, writtenFiles));
 
+        SchemaTableName schemaTableName = new SchemaTableName(writableTableHandle.getSchemaName(), writableTableHandle.getTableName().getTableName());
+        Table icebergTable = getIcebergTable(session, schemaTableName);
+        AppendFiles appendFiles = icebergTable.newAppend();
+        Optional<String> branchName = writableTableHandle.getTableName().getBranchName();
+        branchName.ifPresent(appendFiles::toBranch);
+
+        commitTasks.forEach(task -> handleInsertTask(task, icebergTable, appendFiles, writtenFiles));
         try {
             appendFiles.set(PRESTO_QUERY_ID, session.getQueryId());
             appendFiles.commit();
-            transaction.commitTransaction();
         }
         catch (ValidationException e) {
             log.error(e, "ValidationException in finishWrite");
@@ -684,29 +772,31 @@ public abstract class IcebergAbstractMetadata
                 .collect(toImmutableList()), icebergTable.location())));
     }
 
-    private Optional<ConnectorOutputMetadata> finishWrite(ConnectorSession session, IcebergWritableTableHandle writableTableHandle, Collection<Slice> fragments, ChangelogOperation operationType)
+    private Optional<ConnectorOutputMetadata> finishWrite(ConnectorSession session, SchemaTableName tableName, IcebergWritableTableHandle writableTableHandle, Collection<Slice> fragments, ChangelogOperation operationType)
     {
         if (fragments.isEmpty()) {
-            transaction.commitTransaction();
             return Optional.empty();
         }
 
-        Table icebergTable = transaction.table();
+        Table icebergTable = getIcebergTable(session, tableName);
 
         List<CommitTaskData> commitTasks = fragments.stream()
                 .map(slice -> commitTaskCodec.fromJson(slice.getBytes()))
                 .collect(toImmutableList());
 
-        RowDelta rowDelta = transaction.newRowDelta();
+        RowDelta rowDelta = icebergTable.newRowDelta();
         writableTableHandle.getTableName().getSnapshotId().map(icebergTable::snapshot).ifPresent(s -> rowDelta.validateFromSnapshot(s.snapshotId()));
-        IsolationLevel isolationLevel = IsolationLevel.fromName(icebergTable.properties().getOrDefault(DELETE_ISOLATION_LEVEL, DELETE_ISOLATION_LEVEL_DEFAULT));
+        Optional<String> branchName = writableTableHandle.getTableName().getBranchName();
+        if (branchName.isPresent()) {
+            rowDelta.toBranch(branchName.get());
+        }
 
         ImmutableSet.Builder<String> writtenFiles = ImmutableSet.builder();
         ImmutableSet.Builder<String> referencedDataFiles = ImmutableSet.builder();
         commitTasks.forEach(task -> handleTask(task, icebergTable, rowDelta, writtenFiles, referencedDataFiles));
 
         rowDelta.validateDataFilesExist(referencedDataFiles.build());
-        if (isolationLevel == IsolationLevel.SERIALIZABLE) {
+        if (this.transactionContext.getIsolationLevel() == SERIALIZABLE) {
             rowDelta.validateNoConflictingDataFiles();
         }
 
@@ -719,7 +809,6 @@ public abstract class IcebergAbstractMetadata
         try {
             rowDelta.set(PRESTO_QUERY_ID, session.getQueryId());
             rowDelta.commit();
-            transaction.commitTransaction();
         }
         catch (ValidationException e) {
             log.error(e, "ValidationException in finishWrite");
@@ -814,11 +903,11 @@ public abstract class IcebergAbstractMetadata
     public ColumnHandle getMergeTargetTableRowIdColumnHandle(ConnectorSession session, ConnectorTableHandle tableHandle)
     {
         Types.StructType type = Types.StructType.of(ImmutableList.<NestedField>builder()
-                        .add(MetadataColumns.FILE_PATH)
-                        .add(ROW_POSITION)
-                        .add(SPEC_ID)
-                        .add(NestedField.required(MERGE_PARTITION_DATA.getId(), MERGE_PARTITION_DATA.getColumnName(), StringType.get()))
-                        .build());
+                .add(MetadataColumns.FILE_PATH)
+                .add(ROW_POSITION)
+                .add(SPEC_ID)
+                .add(NestedField.required(MERGE_PARTITION_DATA.getId(), MERGE_PARTITION_DATA.getColumnName(), StringType.get()))
+                .build());
 
         NestedField field = NestedField.required(MERGE_TARGET_ROW_ID_DATA.getId(), MERGE_TARGET_ROW_ID_DATA.getColumnName(), type);
         return IcebergColumnHandle.create(field, typeManager, SYNTHESIZED);
@@ -827,10 +916,17 @@ public abstract class IcebergAbstractMetadata
     @Override
     public ConnectorMergeTableHandle beginMerge(ConnectorSession session, ConnectorTableHandle tableHandle)
     {
+        shouldRunInAutoCommitTransaction("MERGE INTO");
         IcebergTableHandle icebergTableHandle = (IcebergTableHandle) tableHandle;
         verify(icebergTableHandle.getIcebergTableName().getTableType() == DATA, "only the data table can have data merged");
         Table icebergTable = getIcebergTable(session, icebergTableHandle.getSchemaTableName());
+        validateBranchExists(icebergTableHandle, icebergTable);
         int formatVersion = ((BaseTable) icebergTable).operations().current().formatVersion();
+
+        if (formatVersion > MAX_FORMAT_VERSION_FOR_ROW_LEVEL_OPERATIONS) {
+            throw new PrestoException(NOT_SUPPORTED,
+                    format("Iceberg table updates for format version %s are not supported yet", formatVersion));
+        }
 
         if (formatVersion < MIN_FORMAT_VERSION_FOR_DELETE ||
                 !Optional.ofNullable(icebergTable.properties().get(TableProperties.UPDATE_MODE))
@@ -840,7 +936,6 @@ public abstract class IcebergAbstractMetadata
                     "Iceberg table updates require at least format version 2 and update mode must be merge-on-read");
         }
         validateTableMode(session, icebergTable);
-        transaction = icebergTable.newTransaction();
 
         IcebergInsertTableHandle insertHandle = new IcebergInsertTableHandle(
                 icebergTableHandle.getSchemaName(),
@@ -870,7 +965,9 @@ public abstract class IcebergAbstractMetadata
         IcebergWritableTableHandle insertTableHandle =
                 ((IcebergMergeTableHandle) tableHandle).getInsertTableHandle();
 
-        finishWrite(session, insertTableHandle, fragments, UPDATE_AFTER);
+        finishWrite(session,
+                new SchemaTableName(insertTableHandle.getSchemaName(), insertTableHandle.getTableName().getTableName()),
+                insertTableHandle, fragments, UPDATE_AFTER);
     }
 
     @Override
@@ -923,7 +1020,7 @@ public abstract class IcebergAbstractMetadata
         ImmutableMap.Builder<String, Object> properties = ImmutableMap.builder();
         properties.put(TableProperties.DEFAULT_FILE_FORMAT, getFileFormat(icebergTable));
 
-        int formatVersion = ((BaseTable) icebergTable).operations().current().formatVersion();
+        int formatVersion = opsFromTable(icebergTable).current().formatVersion();
         properties.put(TableProperties.FORMAT_VERSION, String.valueOf(formatVersion));
 
         if (!icebergTable.spec().fields().isEmpty()) {
@@ -1010,6 +1107,7 @@ public abstract class IcebergAbstractMetadata
     @Override
     public ConnectorTableHandle beginStatisticsCollection(ConnectorSession session, ConnectorTableHandle tableHandle)
     {
+        shouldRunInAutoCommitTransaction("ANALYZE");
         return tableHandle;
     }
 
@@ -1021,9 +1119,15 @@ public abstract class IcebergAbstractMetadata
         TableStatisticsMaker.writeTableStatistics(nodeVersion, typeManager, icebergTableHandle, icebergTable, session, computedStatistics);
     }
 
+    public ConnectorCommitHandle commit()
+    {
+        transactionContext.commit();
+        return EmptyConnectorCommitHandle.INSTANCE;
+    }
+
     public void rollback()
     {
-        // TODO: cleanup open transaction
+        transactionContext.rollback();
     }
 
     @Override
@@ -1062,19 +1166,20 @@ public abstract class IcebergAbstractMetadata
         if (ifNotExists && branchExists) {
             return;
         }
-        long targetSnapshotId = tableVersion.map(version -> getSnapshotIdForTableVersion(icebergTable, version))
-                .orElseGet(() -> {
-                    if (icebergTable.currentSnapshot() == null) {
-                        throw new PrestoException(NOT_FOUND, format("Table %s has no current snapshot", icebergTableHandle.getSchemaTableName().getTableName()));
-                    }
-                    return icebergTable.currentSnapshot().snapshotId();
-                });
+        Optional<Long> targetSnapshotId = tableVersion
+                .map(version -> getSnapshotIdForTableVersion(icebergTable, version))
+                .or(() -> Optional.ofNullable(icebergTable.currentSnapshot()).map(Snapshot::snapshotId));
         ManageSnapshots manageSnapshots = icebergTable.manageSnapshots();
         if (replace && branchExists) {
-            manageSnapshots.replaceBranch(branchName, targetSnapshotId);
+            targetSnapshotId.ifPresent(snapshotId -> manageSnapshots.replaceBranch(branchName, snapshotId));
         }
         else if (!branchExists) {
-            manageSnapshots.createBranch(branchName, targetSnapshotId);
+            if (targetSnapshotId.isPresent()) {
+                manageSnapshots.createBranch(branchName, targetSnapshotId.get());
+            }
+            else {
+                manageSnapshots.createBranch(branchName);
+            }
         }
         else {
             throw new PrestoException(ALREADY_EXISTS, format("Branch %s already exists in table %s", branchName, icebergTableHandle.getSchemaTableName().getTableName()));
@@ -1083,6 +1188,46 @@ public abstract class IcebergAbstractMetadata
         retainDays.ifPresent(retainDs -> manageSnapshots.setMaxRefAgeMs(branchName, ofDays(retainDs).toMillis()));
         minSnapshotsToKeep.ifPresent(minSnapshots -> manageSnapshots.setMinSnapshotsToKeep(branchName, minSnapshots));
         maxSnapshotAgeDays.ifPresent(maxAgeDays -> manageSnapshots.setMaxSnapshotAgeMs(branchName, ofDays(maxAgeDays).toMillis()));
+        manageSnapshots.commit();
+    }
+
+    @Override
+    public void createTag(
+            ConnectorSession session,
+            ConnectorTableHandle tableHandle,
+            String tagName,
+            boolean replace,
+            boolean ifNotExists,
+            Optional<ConnectorTableVersion> tableVersion,
+            Optional<Long> retainDays)
+    {
+        IcebergTableHandle icebergTableHandle = (IcebergTableHandle) tableHandle;
+        verify(icebergTableHandle.getIcebergTableName().getTableType() == DATA, "only the data table can have tag created");
+        Table icebergTable = getIcebergTable(session, icebergTableHandle.getSchemaTableName());
+
+        boolean tagExists = icebergTable.refs().containsKey(tagName);
+        if (ifNotExists && tagExists) {
+            return;
+        }
+        long targetSnapshotId = tableVersion.map(version -> getSnapshotIdForTableVersion(icebergTable, version))
+                .orElseGet(() -> {
+                    if (icebergTable.currentSnapshot() == null) {
+                        throw new PrestoException(NOT_FOUND, format("Table %s has no current snapshot", icebergTableHandle.getSchemaTableName().getTableName()));
+                    }
+                    return icebergTable.currentSnapshot().snapshotId();
+                });
+        ManageSnapshots manageSnapshots = icebergTable.manageSnapshots();
+        if (replace && tagExists) {
+            manageSnapshots.replaceTag(tagName, targetSnapshotId);
+        }
+        else if (!tagExists) {
+            manageSnapshots.createTag(tagName, targetSnapshotId);
+        }
+        else {
+            throw new PrestoException(ALREADY_EXISTS, format("Tag %s already exists in table %s", tagName, icebergTableHandle.getSchemaTableName().getTableName()));
+        }
+        // Apply retention policies if specified
+        retainDays.ifPresent(retainDs -> manageSnapshots.setMaxRefAgeMs(tagName, ofDays(retainDs).toMillis()));
         manageSnapshots.commit();
     }
 
@@ -1105,7 +1250,7 @@ public abstract class IcebergAbstractMetadata
     @Override
     public void addColumn(ConnectorSession session, ConnectorTableHandle tableHandle, ColumnMetadata column)
     {
-        if (!column.isNullable()) {
+        if (!column.isNullable() && !column.getDefaultValue().isPresent()) {
             throw new PrestoException(NOT_SUPPORTED, "This connector does not support add column with non null");
         }
 
@@ -1113,19 +1258,50 @@ public abstract class IcebergAbstractMetadata
 
         IcebergTableHandle handle = (IcebergTableHandle) tableHandle;
         verify(handle.getIcebergTableName().getTableType() == DATA, "only the data table can have columns added");
+        validateNoBranchSpecified(handle, "ADD COLUMN");
         Table icebergTable = getIcebergTable(session, handle.getSchemaTableName());
-        Transaction transaction = icebergTable.newTransaction();
-        transaction.updateSchema().addColumn(column.getName(), columnType, column.getComment().orElse(null)).commit();
+        UpdateSchema updateSchema = icebergTable.updateSchema();
+        if (column.getDefaultValue().isPresent()) {
+            validateMinimumFormatVersion(icebergTable, 3, format("ADD COLUMN with DEFAULT values is only supported with Iceberg format version 3 or higher. " +
+                    "Table '%s' is currently at format version %d. ", handle.getSchemaTableName(), opsFromTable(icebergTable).current().formatVersion(), handle.getSchemaTableName()));
+            Object defaultValue = column.getDefaultValue().get();
+            Literal<?> defaultLiteral = convertToIcebergLiteral(defaultValue, columnType);
+            updateSchema.addColumn(column.getName(), columnType, column.getComment().orElse(null), defaultLiteral).commit();
+        }
+        else {
+            updateSchema.addColumn(column.getName(), columnType, column.getComment().orElse(null)).commit();
+        }
         if (column.getProperties().containsKey(PARTITIONING_PROPERTY)) {
             List<String> partitioningTransform = (List<String>) column.getProperties().get(PARTITIONING_PROPERTY);
-            UpdatePartitionSpec updatePartitionSpec = transaction.updateSpec();
+            UpdatePartitionSpec updatePartitionSpec = icebergTable.updateSpec();
             for (String transform : partitioningTransform) {
                 updatePartitionSpec = updatePartitionSpec.addField(getPartitionColumnName(column.getName(), transform),
                         getTransformTerm(column.getName(), transform));
             }
             updatePartitionSpec.commit();
         }
-        transaction.commitTransaction();
+    }
+
+    @Override
+    public void setColumnDefault(ConnectorSession session, ConnectorTableHandle tableHandle, String columnName, Object defaultValue)
+    {
+        IcebergTableHandle handle = (IcebergTableHandle) tableHandle;
+        verify(handle.getIcebergTableName().getTableType() == DATA, "only the data table can have column defaults set");
+        validateNoBranchSpecified(handle, "SET COLUMN DEFAULT");
+        Table icebergTable = getIcebergTable(session, handle.getSchemaTableName());
+        validateMinimumFormatVersion(icebergTable, 3, format("SET COLUMN DEFAULT is only supported with Iceberg format version 3 or higher. " +
+                "Table '%s' is currently at format version %d.", handle.getSchemaTableName(), opsFromTable(icebergTable).current().formatVersion()));
+        // Find the column in the schema
+        Types.NestedField field = icebergTable.schema().findField(columnName);
+        if (field == null) {
+            throw new PrestoException(COLUMN_NOT_FOUND, format("Column '%s' does not exist in table '%s'", columnName, handle.getSchemaTableName()));
+        }
+        // Convert the default value to Iceberg literal
+        Literal<?> defaultLiteral = convertToIcebergLiteral(defaultValue, field.type());
+        // updateColumnDefault only updates the write-default value, preserving the existing initial-default
+        icebergTable.updateSchema()
+                .updateColumnDefault(columnName, defaultLiteral)
+                .commit();
     }
 
     @Override
@@ -1134,6 +1310,7 @@ public abstract class IcebergAbstractMetadata
         IcebergTableHandle icebergTableHandle = (IcebergTableHandle) tableHandle;
         IcebergColumnHandle handle = (IcebergColumnHandle) column;
         verify(icebergTableHandle.getIcebergTableName().getTableType() == DATA, "only the data table can have columns dropped");
+        validateNoBranchSpecified(icebergTableHandle, "DROP COLUMN");
         Table icebergTable = getIcebergTable(session, icebergTableHandle.getSchemaTableName());
 
         // Currently drop partition column used in any partition specs of a table would introduce some problems in Iceberg.
@@ -1154,17 +1331,16 @@ public abstract class IcebergAbstractMetadata
     {
         IcebergTableHandle icebergTableHandle = (IcebergTableHandle) tableHandle;
         verify(icebergTableHandle.getIcebergTableName().getTableType() == DATA, "only the data table can have columns renamed");
+        validateNoBranchSpecified(icebergTableHandle, "RENAME COLUMN");
         IcebergColumnHandle columnHandle = (IcebergColumnHandle) source;
         Table icebergTable = getIcebergTable(session, icebergTableHandle.getSchemaTableName());
-        Transaction transaction = icebergTable.newTransaction();
-        transaction.updateSchema().renameColumn(columnHandle.getName(), target).commit();
+        icebergTable.updateSchema().renameColumn(columnHandle.getName(), target).commit();
         icebergTable.spec().fields().stream()
                 .filter(field -> field.sourceId() == columnHandle.getId())
                 .forEach(field -> {
                     String transform = field.transform().toString();
-                    transaction.updateSpec().renameField(field.name(), getPartitionColumnName(target, transform)).commit();
+                    icebergTable.updateSpec().renameField(field.name(), getPartitionColumnName(target, transform)).commit();
                 });
-        transaction.commitTransaction();
     }
 
     @Override
@@ -1200,6 +1376,8 @@ public abstract class IcebergAbstractMetadata
             columnHandles.put(DATA_SEQUENCE_NUMBER.getColumnName(), DATA_SEQUENCE_NUMBER_COLUMN_HANDLE);
             columnHandles.put(IS_DELETED.getColumnName(), IS_DELETED_COLUMN_HANDLE);
             columnHandles.put(DELETE_FILE_PATH.getColumnName(), DELETE_FILE_PATH_COLUMN_HANDLE);
+            columnHandles.put(ROW_ID_COLUMN_HANDLE.getName(), ROW_ID_COLUMN_HANDLE);
+            columnHandles.put(LAST_UPDATED_SEQUENCE_NUMBER_COLUMN_HANDLE.getName(), LAST_UPDATED_SEQUENCE_NUMBER_COLUMN_HANDLE);
         }
         return columnHandles.build();
     }
@@ -1236,7 +1414,7 @@ public abstract class IcebergAbstractMetadata
 
                 return new IcebergTableHandle(
                         storageTableName.getSchemaName(),
-                        new IcebergTableName(storageTableName.getTableName(), name.getTableType(), Optional.empty(), Optional.empty()),
+                        new IcebergTableName(storageTableName.getTableName(), name.getTableType(), Optional.empty(), Optional.empty(), Optional.empty()),
                         name.getSnapshotId().isPresent(),
                         tryGetLocation(storageTable),
                         tryGetProperties(storageTable),
@@ -1246,9 +1424,7 @@ public abstract class IcebergAbstractMetadata
                         getSortFields(storageTable),
                         ImmutableList.of(),
                         Optional.of(tableName));
-            })
-            // null indicates table not found
-            .orElse(null);
+            }).orElse(null); // null indicates table not found
         }
 
         SchemaTableName tableNameToLoad = new SchemaTableName(tableName.getSchemaName(), name.getTableName());
@@ -1261,6 +1437,12 @@ public abstract class IcebergAbstractMetadata
                 })
                 .orElseGet(() -> resolveSnapshotIdByName(table, name));
 
+        // Validate unsupported v3 features (column defaults, encryption) before
+        // proceeding
+        if (table instanceof BaseTable) {
+            validateTableForPresto((BaseTable) table, tableSnapshotId);
+        }
+
         // Get Iceberg tables schema, properties, and location with missing
         // filesystem metadata will fail.
         // See https://github.com/prestodb/presto/pull/21181
@@ -1269,7 +1451,7 @@ public abstract class IcebergAbstractMetadata
 
         return new IcebergTableHandle(
                 tableNameToLoad.getSchemaName(),
-                new IcebergTableName(tableNameToLoad.getTableName(), name.getTableType(), tableSnapshotId, name.getChangelogEndSnapshot()),
+                new IcebergTableName(tableNameToLoad.getTableName(), name.getTableType(), tableSnapshotId, name.getBranchName(), name.getChangelogEndSnapshot()),
                 name.getSnapshotId().isPresent(),
                 tryGetLocation(table),
                 tryGetProperties(table),
@@ -1305,9 +1487,10 @@ public abstract class IcebergAbstractMetadata
     @Override
     public void truncateTable(ConnectorSession session, ConnectorTableHandle tableHandle)
     {
+        shouldRunInAutoCommitTransaction("TRUNCATE TABLE");
         IcebergTableHandle handle = (IcebergTableHandle) tableHandle;
         Table icebergTable = getIcebergTable(session, handle.getSchemaTableName());
-        removeScanFiles(icebergTable, TupleDomain.all());
+        removeScanFiles(handle, icebergTable, TupleDomain.all());
     }
 
     @Override
@@ -1324,14 +1507,14 @@ public abstract class IcebergAbstractMetadata
             throw new PrestoException(NOT_SUPPORTED, "This connector do not allow table execute at specified snapshot");
         }
 
-        transaction = icebergTable.newTransaction();
         BaseProcedure<?> procedure = procedureRegistry.resolve(
                 new ConnectorId(procedureName.getCatalogName()),
                 new SchemaTableName(
                         procedureName.getSchemaName(),
                         procedureName.getObjectName()));
         verify(procedure instanceof DistributedProcedure, "procedure must be DistributedProcedure");
-        procedureContext = Optional.of((IcebergProcedureContext) ((DistributedProcedure) procedure).createContext(icebergTable, transaction));
+        verify(procedureContext.compareAndSet(null, (IcebergCommonProcedureContext) ((DistributedProcedure) procedure).createContext(icebergTable, this, arguments)),
+                "procedure context must not be present");
         return ((DistributedProcedure) procedure).begin(session, procedureContext.get(), tableLayoutHandle, arguments);
     }
 
@@ -1344,10 +1527,9 @@ public abstract class IcebergAbstractMetadata
                         procedureName.getSchemaName(),
                         procedureName.getObjectName()));
         verify(procedure instanceof DistributedProcedure, "procedure must be DistributedProcedure");
-        verify(procedureContext.isPresent(), "procedure context must be present");
+        verify(procedureContext.get() != null, "procedure context must be present");
         ((DistributedProcedure) procedure).finish(session, procedureContext.get(), procedureHandle, fragments);
-        transaction.commitTransaction();
-        procedureContext = Optional.empty();
+        procedureContext.set(null);
     }
 
     @Override
@@ -1359,16 +1541,20 @@ public abstract class IcebergAbstractMetadata
         if (handle.isSnapshotSpecified()) {
             throw new PrestoException(NOT_SUPPORTED, "This connector do not allow delete data at specified snapshot");
         }
+        validateBranchExists(handle, icebergTable);
 
-        int formatVersion = ((BaseTable) icebergTable).operations().current().formatVersion();
+        int formatVersion = opsFromTable(icebergTable).current().formatVersion();
         if (formatVersion < MIN_FORMAT_VERSION_FOR_DELETE) {
             throw new PrestoException(NOT_SUPPORTED, format("This connector only supports delete where one or more partitions are deleted entirely for table versions older than %d", MIN_FORMAT_VERSION_FOR_DELETE));
         }
+        if (formatVersion > MAX_FORMAT_VERSION_FOR_ROW_LEVEL_OPERATIONS) {
+            throw new PrestoException(NOT_SUPPORTED,
+                    format("Iceberg table updates for format version %s are not supported yet", formatVersion));
+        }
         if (getDeleteMode(icebergTable) == RowLevelOperationMode.COPY_ON_WRITE) {
-            throw new PrestoException(NOT_SUPPORTED, "This connector only supports delete where one or more partitions are deleted entirely. Configure write.delete.mode table property to allow row level deletions.");
+            throw new PrestoException(NOT_SUPPORTED, "This connector only supports delete where one or more partitions are deleted entirely. To enable row level deletions, change the write.delete.mode table property to `merge-on-read`.");
         }
         validateTableMode(session, icebergTable);
-        transaction = icebergTable.newTransaction();
 
         return handle;
     }
@@ -1379,8 +1565,12 @@ public abstract class IcebergAbstractMetadata
         IcebergTableHandle handle = (IcebergTableHandle) tableHandle;
         Table icebergTable = getIcebergTable(session, handle.getSchemaTableName());
 
-        RowDelta rowDelta = transaction.newRowDelta();
+        RowDelta rowDelta = icebergTable.newRowDelta();
 
+        Optional<String> branchName = handle.getIcebergTableName().getBranchName();
+        if (branchName.isPresent()) {
+            rowDelta.toBranch(branchName.get());
+        }
         List<CommitTaskData> commitTasks = fragments.stream()
                 .map(slice -> commitTaskCodec.fromJson(slice.getBytes()))
                 .collect(toImmutableList());
@@ -1416,7 +1606,6 @@ public abstract class IcebergAbstractMetadata
         }
 
         rowDelta.commit();
-        transaction.commitTransaction();
         return Optional.empty();
     }
 
@@ -1485,17 +1674,17 @@ public abstract class IcebergAbstractMetadata
         }
 
         TupleDomain<IcebergColumnHandle> domainPredicate = layoutHandle.getValidPredicate();
-        return removeScanFiles(icebergTable, domainPredicate);
+        return removeScanFiles(handle, icebergTable, domainPredicate);
     }
 
     @Override
     public void setTableProperties(ConnectorSession session, ConnectorTableHandle tableHandle, Map<String, Object> properties)
     {
         IcebergTableHandle handle = (IcebergTableHandle) tableHandle;
+        validateNoBranchSpecified(handle, "SET TABLE PROPERTIES");
         Table icebergTable = getIcebergTable(session, handle.getSchemaTableName());
-        transaction = icebergTable.newTransaction();
 
-        UpdateProperties updateProperties = transaction.updateProperties();
+        UpdateProperties updateProperties = icebergTable.updateProperties();
         for (Map.Entry<String, Object> entry : properties.entrySet()) {
             if (!tableProperties.getUpdatableProperties()
                     .contains(entry.getKey())) {
@@ -1512,7 +1701,6 @@ public abstract class IcebergAbstractMetadata
         }
 
         updateProperties.commit();
-        transaction.commitTransaction();
     }
 
     private static PrestoWarning getPrestoWarning(String newPropertyKey, String propertyName)
@@ -1532,18 +1720,20 @@ public abstract class IcebergAbstractMetadata
      *
      * @return the number of rows deleted from all files
      */
-    private OptionalLong removeScanFiles(Table icebergTable, TupleDomain<IcebergColumnHandle> predicate)
+    private OptionalLong removeScanFiles(IcebergTableHandle tableHandle, Table icebergTable, TupleDomain<IcebergColumnHandle> predicate)
     {
-        transaction = icebergTable.newTransaction();
-        DeleteFiles deleteFiles = transaction.newDelete()
-                .deleteFromRowFilter(toIcebergExpression(predicate));
+        DeleteFiles deleteFiles = icebergTable.newDelete();
+        Optional<String> branchName = tableHandle.getIcebergTableName().getBranchName();
+        if (branchName.isPresent()) {
+            deleteFiles = deleteFiles.toBranch(branchName.get());
+        }
+        deleteFiles.deleteFromRowFilter(toIcebergExpression(predicate));
         deleteFiles.commit();
-        transaction.commitTransaction();
 
-        Map<String, String> summary = icebergTable.currentSnapshot().summary();
-        long deletedRecords = parseLong(summary.getOrDefault(DELETED_RECORDS_PROP, "0"));
-        long removedPositionDeletes = parseLong(summary.getOrDefault(REMOVED_POS_DELETES_PROP, "0"));
-        long removedEqualityDeletes = parseLong(summary.getOrDefault(REMOVED_EQ_DELETES_PROP, "0"));
+        Map<String, String> summary = deleteFiles.apply().summary();
+        long deletedRecords = Long.parseLong(summary.getOrDefault(DELETED_RECORDS_PROP, "0"));
+        long removedPositionDeletes = Long.parseLong(summary.getOrDefault(REMOVED_POS_DELETES_PROP, "0"));
+        long removedEqualityDeletes = Long.parseLong(summary.getOrDefault(REMOVED_EQ_DELETES_PROP, "0"));
         // Removed rows count is inaccurate when existing equality delete files
         return OptionalLong.of(deletedRecords - removedPositionDeletes - removedEqualityDeletes);
     }
@@ -1559,6 +1749,20 @@ public abstract class IcebergAbstractMetadata
                 long timestampValue = (long) tableVersion.getTableVersion();
                 long millisUtc = ((TimestampType) tableVersion.getVersionExpressionType()).getPrecision().toMillis(timestampValue);
                 return getSnapshotIdTimeOperator(table, millisUtc, tableVersion.getVersionOperator());
+            }
+            else if (tableVersion.getVersionExpressionType() instanceof BigintType) {
+                return getSnapshotIdTimeOperator(table, (long) tableVersion.getTableVersion(), tableVersion.getVersionOperator());
+            }
+            else if (tableVersion.getVersionExpressionType() instanceof VarcharType) {
+                try {
+                    long millisUtc = Long.parseLong(((Slice) tableVersion.getTableVersion()).toStringUtf8());
+                    return getSnapshotIdTimeOperator(table, millisUtc, tableVersion.getVersionOperator());
+                }
+                catch (NumberFormatException e) {
+                    throw new PrestoException(NOT_SUPPORTED,
+                            "VARCHAR value for time travel must be a numeric epoch millisecond timestamp, got: " +
+                                    ((Slice) tableVersion.getTableVersion()).toStringUtf8());
+                }
             }
             throw new PrestoException(NOT_SUPPORTED, "Unsupported table version expression type: " + tableVersion.getVersionExpressionType());
         }
@@ -1619,7 +1823,14 @@ public abstract class IcebergAbstractMetadata
     {
         IcebergTableHandle handle = (IcebergTableHandle) tableHandle;
         Table icebergTable = getIcebergTable(session, handle.getSchemaTableName());
-        int formatVersion = ((BaseTable) icebergTable).operations().current().formatVersion();
+        validateBranchExists(handle, icebergTable);
+        int formatVersion = opsFromTable(icebergTable).current().formatVersion();
+
+        if (formatVersion > MAX_FORMAT_VERSION_FOR_ROW_LEVEL_OPERATIONS) {
+            throw new PrestoException(NOT_SUPPORTED,
+                    format("Iceberg table updates for format version %s are not supported yet", formatVersion));
+        }
+
         if (formatVersion < MIN_FORMAT_VERSION_FOR_DELETE ||
                 !Optional.ofNullable(icebergTable.properties().get(TableProperties.UPDATE_MODE))
                         .map(mode -> mode.equals(MERGE_ON_READ.modeName()))
@@ -1627,7 +1838,6 @@ public abstract class IcebergAbstractMetadata
             throw new RuntimeException("Iceberg table updates require at least format version 2 and update mode must be merge-on-read");
         }
         validateTableMode(session, icebergTable);
-        transaction = icebergTable.newTransaction();
         return handle
                 .withUpdatedColumns(updatedColumns.stream()
                         .map(IcebergColumnHandle.class::cast)
@@ -1650,7 +1860,7 @@ public abstract class IcebergAbstractMetadata
                 getCompressionCodec(session),
                 icebergTable.properties(),
                 handle.getSortOrder());
-        finishWrite(session, outputTableHandle, fragments, UPDATE_AFTER);
+        finishWrite(session, handle.getSchemaTableName(), outputTableHandle, fragments, UPDATE_AFTER);
     }
 
     protected Optional<String> getDataLocationBasedOnWarehouseDataDir(SchemaTableName schemaTableName)
@@ -1678,6 +1888,8 @@ public abstract class IcebergAbstractMetadata
             MaterializedViewDefinition viewDefinition,
             boolean ignoreExisting)
     {
+        shouldRunInAutoCommitTransaction("CREATE MATERIALIZED VIEW");
+        validateNoBranchInBaseTables(viewDefinition.getBaseTables(), "CREATE MATERIALIZED VIEW");
         try {
             SchemaTableName viewName = viewMetadata.getTable();
             Map<String, Object> materializedViewProperties = viewMetadata.getProperties();
@@ -1696,46 +1908,52 @@ public abstract class IcebergAbstractMetadata
                     viewMetadata.getColumns(),
                     materializedViewProperties,
                     viewMetadata.getComment());
-            createTable(session, storageTableMetadata, false);
 
-            try {
-                Map<String, String> properties = new HashMap<>();
-                properties.put(PRESTO_MATERIALIZED_VIEW_FORMAT_VERSION, CURRENT_MATERIALIZED_VIEW_FORMAT_VERSION + "");
-                properties.put(PRESTO_MATERIALIZED_VIEW_ORIGINAL_SQL, viewDefinition.getOriginalSql());
-                properties.put(PRESTO_MATERIALIZED_VIEW_STORAGE_SCHEMA, storageTableName.getSchemaName());
-                properties.put(PRESTO_MATERIALIZED_VIEW_STORAGE_TABLE_NAME, storageTableName.getTableName());
-
-                String baseTablesStr = serializeSchemaTableNames(viewDefinition.getBaseTables());
-                properties.put(PRESTO_MATERIALIZED_VIEW_BASE_TABLES, baseTablesStr);
-                properties.put(PRESTO_MATERIALIZED_VIEW_COLUMN_MAPPINGS, serializeColumnMappings(viewDefinition.getColumnMappings()));
-                properties.put(PRESTO_MATERIALIZED_VIEW_OWNER, viewDefinition.getOwner()
-                        .orElseThrow(() -> new PrestoException(INVALID_VIEW, "Materialized view owner is required")));
-                properties.put(PRESTO_MATERIALIZED_VIEW_SECURITY_MODE, viewDefinition.getSecurityMode()
-                        .orElseThrow(() -> new PrestoException(INVALID_VIEW, "Materialized view security mode is required (set legacy_materialized_views=false)"))
-                        .name());
-
-                getStaleReadBehavior(materializedViewProperties)
-                        .ifPresent(behavior -> properties.put(PRESTO_MATERIALIZED_VIEW_STALE_READ_BEHAVIOR, behavior.name()));
-                getStalenessWindow(materializedViewProperties)
-                        .ifPresent(window -> properties.put(PRESTO_MATERIALIZED_VIEW_STALENESS_WINDOW, window.toString()));
-                MaterializedViewRefreshType refreshType = getRefreshType(materializedViewProperties);
-                properties.put(PRESTO_MATERIALIZED_VIEW_REFRESH_TYPE, refreshType.name());
-
-                for (SchemaTableName baseTable : viewDefinition.getBaseTables()) {
-                    properties.put(getBaseTableViewPropertyName(baseTable), "0");
-                }
-
-                createIcebergView(session, viewName, viewMetadata.getColumns(), viewDefinition.getOriginalSql(), properties);
-            }
-            catch (Exception e) {
+            // Create materialized view should run after the creation of the underlying storage table
+            transactionContext.registerCallback(() -> {
                 try {
-                    dropStorageTable(session, storageTableName);
+                    Map<String, String> properties = new HashMap<>();
+                    properties.put(PRESTO_MATERIALIZED_VIEW_FORMAT_VERSION, CURRENT_MATERIALIZED_VIEW_FORMAT_VERSION + "");
+                    properties.put(PRESTO_MATERIALIZED_VIEW_ORIGINAL_SQL, viewDefinition.getOriginalSql());
+                    properties.put(PRESTO_MATERIALIZED_VIEW_STORAGE_SCHEMA, storageTableName.getSchemaName());
+                    properties.put(PRESTO_MATERIALIZED_VIEW_STORAGE_TABLE_NAME, storageTableName.getTableName());
+
+                    String baseTablesStr = serializeSchemaTableNames(viewDefinition.getBaseTables());
+                    properties.put(PRESTO_MATERIALIZED_VIEW_BASE_TABLES, baseTablesStr);
+                    properties.put(PRESTO_MATERIALIZED_VIEW_COLUMN_MAPPINGS, serializeColumnMappings(viewDefinition.getColumnMappings()));
+                    properties.put(PRESTO_MATERIALIZED_VIEW_OWNER, viewDefinition.getOwner()
+                            .orElseThrow(() -> new PrestoException(INVALID_VIEW, "Materialized view owner is required")));
+                    properties.put(PRESTO_MATERIALIZED_VIEW_SECURITY_MODE, viewDefinition.getSecurityMode()
+                            .orElseThrow(() -> new PrestoException(INVALID_VIEW, "Materialized view security mode is required (set legacy_materialized_views=false)"))
+                            .name());
+
+                    getStaleReadBehavior(materializedViewProperties)
+                            .ifPresent(behavior -> properties.put(PRESTO_MATERIALIZED_VIEW_STALE_READ_BEHAVIOR, behavior.name()));
+                    getStalenessWindow(materializedViewProperties)
+                            .ifPresent(window -> properties.put(PRESTO_MATERIALIZED_VIEW_STALENESS_WINDOW, window.toString()));
+                    getRefreshType(materializedViewProperties)
+                            .ifPresent(refreshType -> properties.put(PRESTO_MATERIALIZED_VIEW_REFRESH_TYPE, refreshType.name()));
+                    OptionalInt maxSnapshotsPerRefresh = getMaxSnapshotsPerRefresh(materializedViewProperties);
+                    if (maxSnapshotsPerRefresh.isPresent()) {
+                        properties.put(PRESTO_MATERIALIZED_VIEW_MAX_SNAPSHOTS_PER_REFRESH, Integer.toString(maxSnapshotsPerRefresh.getAsInt()));
+                    }
+
+                    for (SchemaTableName baseTable : viewDefinition.getBaseTables()) {
+                        properties.put(getBaseTableViewPropertyName(baseTable), "0");
+                    }
+                    createIcebergView(session, viewName, viewMetadata.getColumns(), viewDefinition.getOriginalSql(), properties);
                 }
-                catch (Exception cleanupException) {
-                    e.addSuppressed(cleanupException);
+                catch (Exception e) {
+                    try {
+                        dropStorageTable(session, storageTableName);
+                    }
+                    catch (Exception cleanupException) {
+                        e.addSuppressed(cleanupException);
+                    }
+                    throw e;
                 }
-                throw e;
-            }
+            });
+            createTable(session, storageTableMetadata, false);
         }
         catch (PrestoException e) {
             if (e.getErrorCode() == NOT_SUPPORTED.toErrorCode()) {
@@ -1836,6 +2054,25 @@ public abstract class IcebergAbstractMetadata
         Optional<MaterializedViewRefreshType> refreshType = getOptionalEnumProperty(
                 viewProperties, PRESTO_MATERIALIZED_VIEW_REFRESH_TYPE, MaterializedViewRefreshType.class);
 
+        Optional<List<String>> validRefreshColumns = Optional.empty();
+        try {
+            SchemaTableName storageTable = new SchemaTableName(storageSchema, storageTableName);
+            Table icebergStorageTable = getIcebergTable(session, storageTable);
+            PartitionSpec spec = icebergStorageTable.spec();
+            if (spec.isPartitioned()) {
+                List<String> partitionColumns = spec.fields().stream()
+                        .filter(field -> field.transform().isIdentity())
+                        .map(field -> spec.schema().findColumnName(field.sourceId()))
+                        .collect(toImmutableList());
+                if (!partitionColumns.isEmpty()) {
+                    validRefreshColumns = Optional.of(partitionColumns);
+                }
+            }
+        }
+        catch (NoSuchTableException e) {
+            // Storage table may not exist yet or may have been dropped; proceed without refresh columns
+        }
+
         return Optional.of(new MaterializedViewDefinition(
                 originalSql,
                 storageSchema,
@@ -1845,7 +2082,7 @@ public abstract class IcebergAbstractMetadata
                 Optional.of(securityMode),
                 columnMappings,
                 ImmutableList.of(),
-                Optional.empty(),
+                validRefreshColumns,
                 stalenessConfig,
                 refreshType));
     }
@@ -1853,9 +2090,11 @@ public abstract class IcebergAbstractMetadata
     @Override
     public void dropMaterializedView(ConnectorSession session, SchemaTableName viewName)
     {
+        shouldRunInAutoCommitTransaction("DROP MATERIALIZED VIEW");
         Optional<MaterializedViewDefinition> definition = getMaterializedView(session, viewName);
 
         if (definition.isPresent()) {
+            // Drop materialized view should run before the dropping of the underlying storage table
             dropIcebergView(session, viewName);
             SchemaTableName storageTableName = new SchemaTableName(
                     definition.get().getSchema(),
@@ -1865,6 +2104,22 @@ public abstract class IcebergAbstractMetadata
                 dropTable(session, storageTableHandle);
             }
         }
+    }
+
+    @Override
+    public void setMaterializedViewProperties(ConnectorSession session, SchemaTableName viewName, Map<String, Object> properties)
+    {
+        if (!getMaterializedView(session, viewName).isPresent()) {
+            throw new PrestoException(NOT_FOUND, "Materialized view does not exist: " + viewName);
+        }
+
+        ImmutableMap.Builder<String, String> updates = ImmutableMap.builder();
+        for (Map.Entry<String, Object> entry : properties.entrySet()) {
+            Map.Entry<String, String> serialized = serializeForUpdate(entry.getKey(), entry.getValue());
+            updates.put(serialized.getKey(), serialized.getValue());
+        }
+
+        updateIcebergViewProperties(session, viewName, updates.build());
     }
 
     @Override
@@ -1893,20 +2148,42 @@ public abstract class IcebergAbstractMetadata
         Table storageTable = getIcebergTable(session, storageTableName);
         long lastRefreshSnapshotId = parseLong(lastRefreshSnapshotStr);
         Snapshot lastRefreshSnapshot = storageTable.snapshot(lastRefreshSnapshotId);
+        Optional<Long> lastFreshTime;
         if (lastRefreshSnapshot == null) {
-            throw new PrestoException(ICEBERG_INVALID_MATERIALIZED_VIEW,
-                    format("Storage table snapshot %d not found for materialized view %s. " +
-                            "The snapshot may have been expired. Consider refreshing the view.",
-                            lastRefreshSnapshotId, materializedViewName));
+            // Handle the case where the MV query produced no rows at refresh time.
+            // This can happen when base tables are empty, or when the query itself yields no results.
+            // In this case:
+            //   - lastRefreshSnapshotId = 0 (a sentinel value indicating "no data written at refresh time")
+            //   - storageTable.currentSnapshot() = null (no Iceberg snapshots because no data was written)
+            if (lastRefreshSnapshotId == 0L && storageTable.currentSnapshot() == null) {
+                lastFreshTime = Optional.empty();
+            }
+            else {
+                throw new PrestoException(ICEBERG_INVALID_MATERIALIZED_VIEW,
+                        format("Storage table snapshot %d not found for materialized view %s. " +
+                                        "The snapshot may have been expired. Consider refreshing the view.",
+                                lastRefreshSnapshotId, materializedViewName));
+            }
         }
-        Optional<Long> lastFreshTime = Optional.of(lastRefreshSnapshot.timestampMillis());
+        else {
+            lastFreshTime = Optional.of(lastRefreshSnapshot.timestampMillis());
+        }
 
-        boolean isStale = false;
+        OptionalInt maxSnapshotsPerRefresh = resolveMaxSnapshotsPerRefresh(session, props);
+
+        ImmutableMap.Builder<SchemaTableName, MaterializedViewStatus.MaterializedDataPredicates> predicatesByBase = ImmutableMap.builder();
         for (SchemaTableName baseTable : definition.get().getBaseTables()) {
             Table baseIcebergTable = getIcebergTable(session, baseTable);
             long currentSnapshotId = baseIcebergTable.currentSnapshot() != null
                     ? baseIcebergTable.currentSnapshot().snapshotId()
                     : 0L;
+
+            if (maxSnapshotsPerRefresh.isPresent() && !supportsRowLineage(baseIcebergTable)) {
+                session.getWarningCollector().add(new PrestoWarning(
+                        BOUNDED_REFRESH_IGNORED,
+                        format("max_snapshots_per_refresh ignored for materialized view %s: base table %s is Iceberg V2 and lacks row lineage; advancing to HEAD",
+                                materializedViewName, baseTable)));
+            }
 
             String key = getBaseTableViewPropertyName(baseTable);
             String recordedSnapshotStr = props.get(key);
@@ -1916,23 +2193,254 @@ public abstract class IcebergAbstractMetadata
             }
             long recordedSnapshotId = parseLong(recordedSnapshotStr);
 
-            if (currentSnapshotId != recordedSnapshotId) {
-                isStale = true;
-                break;
+            if (currentSnapshotId == recordedSnapshotId) {
+                continue;
+            }
+
+            // Rollback or branch reset can strand the watermark off HEAD's ancestry; the diff is
+            // meaningless, so signal NOT_MATERIALIZED to force a full refresh.
+            if (currentSnapshotId != 0 && !isAncestorOf(baseIcebergTable, currentSnapshotId, recordedSnapshotId)) {
+                return new MaterializedViewStatus(NOT_MATERIALIZED, ImmutableMap.of(), lastFreshTime);
+            }
+
+            long targetSnapshotId = chooseTargetSnapshot(baseIcebergTable, recordedSnapshotId, maxSnapshotsPerRefresh)
+                    .orElse(currentSnapshotId);
+
+            // Partition disjuncts must cover (watermark, HEAD] — not (watermark, target] — so stale-read
+            // stitching sees every dirty partition. The bound narrows refresh work via
+            // incrementalRefreshPredicate, which only the refresh path applies.
+            Optional<List<TupleDomain<String>>> partitionConstraints = detectChangedPartitions(
+                    session,
+                    baseTable,
+                    recordedSnapshotId,
+                    currentSnapshotId);
+
+            if (partitionConstraints.isEmpty()) {
+                // Couldn't determine changed partitions, treat as not materialized
+                return new MaterializedViewStatus(NOT_MATERIALIZED, ImmutableMap.of(), lastFreshTime);
+            }
+
+            TupleDomain<String> incrementalRefreshPredicate = TupleDomain.all();
+            if (targetSnapshotId != currentSnapshotId) {
+                long targetSequenceNumber = baseIcebergTable.snapshot(targetSnapshotId).sequenceNumber();
+                incrementalRefreshPredicate = TupleDomain.withColumnDomains(ImmutableMap.of(
+                        MetadataColumns.LAST_UPDATED_SEQUENCE_NUMBER.name(),
+                        Domain.create(ValueSet.ofRanges(Range.lessThanOrEqual(BigintType.BIGINT, targetSequenceNumber)), false)));
+            }
+
+            // We pass an empty list of column names for now as they are not used when legacy_materialized_views=false.
+            predicatesByBase.put(baseTable, new MaterializedViewStatus.MaterializedDataPredicates(
+                    partitionConstraints.get(),
+                    ImmutableList.of(),
+                    incrementalRefreshPredicate));
+        }
+
+        Map<SchemaTableName, MaterializedViewStatus.MaterializedDataPredicates> staleBases = predicatesByBase.build();
+        if (staleBases.isEmpty()) {
+            return new MaterializedViewStatus(FULLY_MATERIALIZED, ImmutableMap.of(), lastFreshTime);
+        }
+        return new MaterializedViewStatus(PARTIALLY_MATERIALIZED, staleBases, lastFreshTime);
+    }
+
+    private Optional<List<TupleDomain<String>>> detectChangedPartitions(
+            ConnectorSession session,
+            SchemaTableName baseTable,
+            long recordedSnapshotId,
+            long currentSnapshotId)
+    {
+        Table baseIcebergTable = getIcebergTable(session, baseTable);
+        PartitionSpec spec = baseIcebergTable.spec();
+
+        if (spec.isUnpartitioned()) {
+            // Optional.of(emptyList) = "the entire table is stale" (no per-partition predicates to stitch on).
+            // This is distinct from Optional.empty() = "we cannot determine staleness" (bail out to NOT_MATERIALIZED).
+            return Optional.of(ImmutableList.of());
+        }
+
+        for (PartitionField field : spec.fields()) {
+            if (!field.transform().isIdentity()) {
+                return Optional.of(ImmutableList.of());
             }
         }
 
-        if (isStale) {
-            return new MaterializedViewStatus(
-                    PARTIALLY_MATERIALIZED,
-                    ImmutableMap.of(),
-                    lastFreshTime);
+        if (hasPartitionEvolution(baseIcebergTable, recordedSnapshotId, currentSnapshotId)) {
+            return Optional.empty();
         }
 
-        return new MaterializedViewStatus(
-                FULLY_MATERIALIZED,
-                ImmutableMap.of(),
-                lastFreshTime);
+        Optional<Set<StructLike>> changedPartitions = collectChangedPartitions(
+                baseIcebergTable,
+                recordedSnapshotId,
+                currentSnapshotId);
+
+        if (changedPartitions.isEmpty()) {
+            return Optional.empty();
+        }
+
+        if (changedPartitions.get().size() > getMaterializedViewMaxChangedPartitions(session)) {
+            return Optional.empty();
+        }
+
+        List<TupleDomain<String>> partitionConstraints = convertPartitionsToConstraints(
+                session,
+                baseIcebergTable,
+                spec,
+                changedPartitions.get());
+
+        return Optional.of(partitionConstraints);
+    }
+
+    /**
+     * Returns the snapshot id a bounded refresh should advance a base's watermark to, or empty
+     * if no bounded target applies (V2 base, already at HEAD, watermark off HEAD's ancestry, or
+     * unbounded). Callers fall through to HEAD with {@code orElse(currentSnapshotId)}.
+     */
+    static OptionalLong chooseTargetSnapshot(Table baseTable, long watermark, OptionalInt maxSnapshots)
+    {
+        Snapshot currentSnapshot = baseTable.currentSnapshot();
+        if (currentSnapshot == null) {
+            return OptionalLong.empty();
+        }
+        if (!supportsRowLineage(baseTable)) {
+            return OptionalLong.empty();
+        }
+        long head = currentSnapshot.snapshotId();
+        if (head == watermark) {
+            return OptionalLong.empty();
+        }
+        // Without this guard, ancestorIdsBetween walks to the root when watermark isn't on HEAD's
+        // ancestry (rollback, branch reset, sentinel 0, expired snapshot) and the caller rewinds.
+        if (!isAncestorOf(baseTable, head, watermark)) {
+            return OptionalLong.empty();
+        }
+        // ancestorIdsBetween returns HEAD-first over the half-open range (watermark, HEAD].
+        List<Long> ancestorIds = ImmutableList.copyOf(ancestorIdsBetween(head, watermark, baseTable::snapshot));
+        if (ancestorIds.isEmpty()) {
+            return OptionalLong.empty();
+        }
+        if (maxSnapshots.isEmpty() || ancestorIds.size() <= maxSnapshots.getAsInt()) {
+            return OptionalLong.of(ancestorIds.get(0));
+        }
+        return OptionalLong.of(ancestorIds.get(ancestorIds.size() - maxSnapshots.getAsInt()));
+    }
+
+    /**
+     * Persisted MV property wins; otherwise session default applies.
+     */
+    static OptionalInt resolveMaxSnapshotsPerRefresh(ConnectorSession session, Map<String, String> viewProperties)
+    {
+        String persisted = viewProperties.get(PRESTO_MATERIALIZED_VIEW_MAX_SNAPSHOTS_PER_REFRESH);
+        if (persisted != null) {
+            return OptionalInt.of(parseInt(persisted));
+        }
+        return getMaterializedViewDefaultMaxSnapshotsPerRefresh(session);
+    }
+
+    private Optional<Set<StructLike>> collectChangedPartitions(
+            Table icebergTable,
+            long fromSnapshotId,
+            long toSnapshotId)
+    {
+        // Check for operations that would make incremental partition detection unreliable.
+        // IncrementalAppendScan only tracks files added by APPEND operations, so we must
+        // reject any snapshot with an operation whose changes it cannot capture:
+        // - APPEND: Safe - new files are tracked by IncrementalAppendScan
+        // - REPLACE: Safe - files rewritten without changing data (compaction), no staleness
+        // - OVERWRITE: Unsafe - adds and removes files, but IncrementalAppendScan only sees
+        //   APPEND operations, so partitions affected by overwrites would be missed
+        // - DELETE: Unsafe - data removed without adding new files, IncrementalAppendScan misses this
+        long fromSequenceNumber = icebergTable.snapshot(fromSnapshotId).sequenceNumber();
+        long toSequenceNumber = icebergTable.snapshot(toSnapshotId).sequenceNumber();
+        for (Snapshot snapshot : icebergTable.snapshots()) {
+            if (snapshot.sequenceNumber() > fromSequenceNumber &&
+                    snapshot.sequenceNumber() <= toSequenceNumber) {
+                String operation = snapshot.operation();
+                if (!APPEND.equals(operation) && !REPLACE.equals(operation)) {
+                    return Optional.empty();
+                }
+            }
+        }
+
+        Set<StructLike> partitions = new HashSet<>();
+
+        IncrementalAppendScan scan = icebergTable.newIncrementalAppendScan()
+                .fromSnapshotExclusive(fromSnapshotId)
+                .toSnapshot(toSnapshotId);
+
+        try (CloseableIterable<FileScanTask> tasks = scan.planFiles()) {
+            for (FileScanTask task : tasks) {
+                partitions.add(task.file().partition());
+            }
+        }
+        catch (IOException e) {
+            throw new UncheckedIOException("Failed to scan changed partitions", e);
+        }
+
+        return Optional.of(ImmutableSet.copyOf(partitions));
+    }
+
+    private List<TupleDomain<String>> convertPartitionsToConstraints(
+            ConnectorSession session,
+            Table icebergTable,
+            PartitionSpec spec,
+            Set<StructLike> partitions)
+    {
+        List<TupleDomain<String>> constraints = new ArrayList<>();
+
+        for (StructLike partition : partitions) {
+            Map<String, Domain> domainMap = new HashMap<>();
+
+            for (int i = 0; i < spec.fields().size(); i++) {
+                PartitionField field = spec.fields().get(i);
+                String sourceColumnName = icebergTable.schema().findColumnName(field.sourceId());
+
+                if (sourceColumnName == null) {
+                    throw new PrestoException(ICEBERG_INVALID_MATERIALIZED_VIEW,
+                            format("Partition field %s references non-existent column ID %d", field.name(), field.sourceId()));
+                }
+
+                String normalizedColumnName = normalizeIdentifier(session, sourceColumnName);
+
+                Object value = partition.get(i, Object.class);
+                Type icebergType = icebergTable.schema().findType(field.sourceId());
+                Domain domain = createDomainFromIcebergPartitionValue(value, icebergType, toPrestoType(icebergType, typeManager));
+                domainMap.put(normalizedColumnName, domain);
+            }
+
+            if (!domainMap.isEmpty()) {
+                constraints.add(TupleDomain.withColumnDomains(domainMap));
+            }
+        }
+
+        return constraints;
+    }
+
+    private boolean hasPartitionEvolution(
+            Table icebergTable,
+            long fromSnapshotId,
+            long toSnapshotId)
+    {
+        Snapshot fromSnapshot = icebergTable.snapshot(fromSnapshotId);
+        if (fromSnapshot == null) {
+            throw new PrestoException(ICEBERG_INVALID_SNAPSHOT_ID,
+                    format("Base table snapshot %d no longer exists (possibly expired). Materialized view requires full refresh.", fromSnapshotId));
+        }
+
+        Snapshot toSnapshot = icebergTable.snapshot(toSnapshotId);
+        if (toSnapshot == null) {
+            throw new PrestoException(ICEBERG_INVALID_SNAPSHOT_ID,
+                    format("Base table snapshot %d does not exist", toSnapshotId));
+        }
+
+        // Get partition spec IDs from manifests in each snapshot
+        Set<Integer> fromSpecIds = fromSnapshot.allManifests(icebergTable.io()).stream()
+                .map(ManifestFile::partitionSpecId)
+                .collect(toImmutableSet());
+
+        Set<Integer> toSpecIds = toSnapshot.allManifests(icebergTable.io()).stream()
+                .map(ManifestFile::partitionSpecId)
+                .collect(toImmutableSet());
+
+        return !fromSpecIds.equals(toSpecIds);
     }
 
     @Override
@@ -1940,6 +2448,7 @@ public abstract class IcebergAbstractMetadata
             ConnectorSession session,
             ConnectorTableHandle tableHandle)
     {
+        shouldRunInAutoCommitTransaction("REFRESH MATERIALIZED VIEW");
         IcebergTableHandle icebergTableHandle = (IcebergTableHandle) tableHandle;
 
         if (icebergTableHandle.getMaterializedViewName().isEmpty()) {
@@ -1951,12 +2460,12 @@ public abstract class IcebergAbstractMetadata
         SchemaTableName storageTableName = icebergTableHandle.getSchemaTableName();
         IcebergTableHandle storageTableHandle = getTableHandle(session, storageTableName);
         Table storageTable = getIcebergTable(session, storageTableName);
-
-        transaction = storageTable.newTransaction();
-
-        transaction.newDelete().deleteFromRowFilter(alwaysTrue()).commit();
-
         SchemaTableName materializedViewName = icebergTableHandle.getMaterializedViewName().get();
+        MaterializedViewStatus status = getMaterializedViewStatus(session, materializedViewName, TupleDomain.all());
+        boolean fullRefreshRequired = !status.isFullyMaterialized()
+                && (status.getPartitionsFromBaseTables().isEmpty()
+                || status.getPartitionsFromBaseTables().values().stream()
+                .anyMatch(p -> p.getPredicateDisjuncts().isEmpty()));
 
         return new IcebergInsertTableHandle(
                 storageTableHandle.getSchemaName(),
@@ -1969,7 +2478,8 @@ public abstract class IcebergAbstractMetadata
                 getCompressionCodec(session),
                 storageTable.properties(),
                 getSupportedSortFields(storageTable.schema(), storageTable.sortOrder()),
-                Optional.of(materializedViewName));
+                Optional.of(materializedViewName),
+                fullRefreshRequired);
     }
 
     @Override
@@ -1979,42 +2489,106 @@ public abstract class IcebergAbstractMetadata
             Collection<Slice> fragments,
             Collection<ComputedStatistics> computedStatistics)
     {
-        Optional<ConnectorOutputMetadata> result = finishInsert(session, insertHandle, fragments, computedStatistics);
-
         IcebergInsertTableHandle icebergInsertHandle = (IcebergInsertTableHandle) insertHandle;
+        SchemaTableName materializedViewName = icebergInsertHandle.getMaterializedViewName()
+                .orElseThrow(() -> new IllegalStateException("finishRefreshMaterializedView called without materialized view name"));
 
-        icebergInsertHandle.getMaterializedViewName().ifPresent(materializedViewName -> {
-            SchemaTableName storageTableName = new SchemaTableName(
-                    icebergInsertHandle.getSchemaName(),
-                    icebergInsertHandle.getTableName().getTableName());
+        SchemaTableName storageTableName = new SchemaTableName(
+                icebergInsertHandle.getSchemaName(),
+                icebergInsertHandle.getTableName().getTableName());
+        Table icebergTable = getIcebergTable(session, storageTableName);
 
-            Table storageTable = getIcebergTable(session, storageTableName);
-            long newSnapshotId = storageTable.currentSnapshot() != null
-                    ? storageTable.currentSnapshot().snapshotId()
-                    : 0L;
+        Optional<ConnectorOutputMetadata> result;
+        if (fragments.isEmpty()) {
+            transactionContext.commit();
+            result = Optional.empty();
+        }
+        else {
+            List<CommitTaskData> commitTasks = fragments.stream()
+                    .map(slice -> commitTaskCodec.fromJson(slice.getBytes()))
+                    .collect(toImmutableList());
 
-            Optional<MaterializedViewDefinition> definition = getMaterializedView(session, materializedViewName);
-            Map<String, String> properties = new HashMap<>();
-            properties.put(PRESTO_MATERIALIZED_VIEW_LAST_REFRESH_SNAPSHOT_ID, String.valueOf(newSnapshotId));
-
-            if (definition.isPresent()) {
-                for (SchemaTableName baseTable : definition.get().getBaseTables()) {
-                    try {
-                        Table baseIcebergTable = getIcebergTable(session, baseTable);
-                        long baseSnapshotId = baseIcebergTable.currentSnapshot() != null
-                                ? baseIcebergTable.currentSnapshot().snapshotId()
-                                : 0L;
-                        String key = getBaseTableViewPropertyName(baseTable);
-                        properties.put(key, baseSnapshotId + "");
-                    }
-                    catch (Exception e) {
-                        log.warn(e, "Failed to capture snapshot for base table %s during refresh of materialized view %s", baseTable, materializedViewName);
-                    }
-                }
+            ImmutableSet.Builder<String> writtenFiles = ImmutableSet.builder();
+            Consumer<DataFile> addFile;
+            SnapshotUpdate<?> snapshotUpdate;
+            if (icebergInsertHandle.isFullRefreshRequired()) {
+                OverwriteFiles overwrite = icebergTable.newOverwrite();
+                overwrite.overwriteByRowFilter(Expressions.alwaysTrue());
+                addFile = overwrite::addFile;
+                snapshotUpdate = overwrite;
+            }
+            else {
+                ReplacePartitions replacePartitions = icebergTable.newReplacePartitions();
+                addFile = replacePartitions::addFile;
+                snapshotUpdate = replacePartitions;
             }
 
+            for (CommitTaskData task : commitTasks) {
+                PartitionSpec partitionSpec = icebergTable.specs().get(task.getPartitionSpecId());
+                Type[] partitionColumnTypes = partitionSpec.fields().stream()
+                        .map(field -> field.transform().getResultType(icebergTable.schema().findType(field.sourceId())))
+                        .toArray(Type[]::new);
+                handleFinishData(task, icebergTable, partitionSpec, partitionColumnTypes, addFile, writtenFiles);
+            }
+            try {
+                snapshotUpdate.set(PRESTO_QUERY_ID, session.getQueryId());
+                snapshotUpdate.commit();
+            }
+            catch (ValidationException e) {
+                throw new PrestoException(ICEBERG_COMMIT_ERROR, "Failed to commit Iceberg update to table: " + icebergInsertHandle.getTableName(), e);
+            }
+
+            result = Optional.of(new HiveOutputMetadata(new HiveOutputInfo(commitTasks.stream()
+                    .map(CommitTaskData::getPath)
+                    .collect(toImmutableList()), icebergTable.location())));
+        }
+
+        Table storageTable = getIcebergTable(session, storageTableName);
+        long newSnapshotId = storageTable.currentSnapshot() != null
+                ? storageTable.currentSnapshot().snapshotId()
+                : 0L;
+
+        Optional<MaterializedViewDefinition> definition = getMaterializedView(session, materializedViewName);
+        Map<String, String> properties = new HashMap<>();
+        properties.put(PRESTO_MATERIALIZED_VIEW_LAST_REFRESH_SNAPSHOT_ID, String.valueOf(newSnapshotId));
+
+        if (definition.isPresent()) {
+            Map<String, String> viewProperties = getViewMetadata(session, materializedViewName)
+                    .map(IcebergViewMetadata::getProperties)
+                    .orElse(ImmutableMap.of());
+            OptionalInt maxSnapshotsPerRefresh = resolveMaxSnapshotsPerRefresh(session, viewProperties);
+
+            for (SchemaTableName baseTable : definition.get().getBaseTables()) {
+                try {
+                    Table baseIcebergTable = getIcebergTable(session, baseTable);
+                    Snapshot baseHeadSnapshot = baseIcebergTable.currentSnapshot();
+                    String key = getBaseTableViewPropertyName(baseTable);
+                    if (baseHeadSnapshot == null) {
+                        properties.put(key, "0");
+                        continue;
+                    }
+                    long baseHeadId = baseHeadSnapshot.snapshotId();
+                    String recordedSnapshotStr = viewProperties.get(key);
+                    long recordedSnapshotId = recordedSnapshotStr == null ? 0L : parseLong(recordedSnapshotStr);
+                    long newWatermark = chooseTargetSnapshot(baseIcebergTable, recordedSnapshotId, maxSnapshotsPerRefresh)
+                            .orElse(baseHeadId);
+                    properties.put(key, Long.toString(newWatermark));
+                }
+                catch (Exception e) {
+                    log.warn(e, "Failed to capture snapshot for base table %s during refresh of materialized view %s", baseTable, materializedViewName);
+                }
+            }
+        }
+
+        if (fragments.isEmpty()) {
+            // When no data was written, finishInsert already committed the transaction.
+            // Callbacks registered after that commit won't execute, so update properties directly.
             updateIcebergViewProperties(session, materializedViewName, properties);
-        });
+        }
+        else {
+            // Update materialized view should run after the data refresh of the underlying storage table
+            this.transactionContext.registerCallback(() -> updateIcebergViewProperties(session, materializedViewName, properties));
+        }
 
         return result;
     }
@@ -2026,7 +2600,7 @@ public abstract class IcebergAbstractMetadata
             return getMaterializedViewStoragePrefix(session) + viewName.getTableName();
         });
         String schema = getStorageSchema(properties)
-                .orElse(viewName.getSchemaName());
+                .orElseGet(() -> getMaterializedViewDefaultStorageSchema(session).orElse(viewName.getSchemaName()));
         return new SchemaTableName(schema, tableName);
     }
 
@@ -2101,5 +2675,37 @@ public abstract class IcebergAbstractMetadata
     private boolean viewExists(ConnectorSession session, ConnectorTableMetadata viewMetadata)
     {
         return getViewMetadata(session, viewMetadata.getTable()).isPresent();
+    }
+
+    @Override
+    public void setColumnType(ConnectorSession session, ConnectorTableHandle tableHandle, ColumnHandle columnHandle, com.facebook.presto.common.type.Type type)
+    {
+        IcebergTableHandle table = (IcebergTableHandle) tableHandle;
+        IcebergColumnHandle column = (IcebergColumnHandle) columnHandle;
+
+        Table icebergTable = getIcebergTable(session, table.getSchemaTableName());
+        try {
+            icebergTable.updateSchema()
+                    .updateColumn(column.getName(), toIcebergType(type).asPrimitiveType())
+                    .commit();
+        }
+        catch (RuntimeException e) {
+            throw new PrestoException(ICEBERG_INCOMPATIBLE_COLUMN_TYPE, "Failed to set column type: " + firstNonNull(e.getMessage(), e), e);
+        }
+    }
+
+    protected void openCreateTableTransaction(SchemaTableName tableName, Transaction transaction)
+    {
+        transactionContext.registerTransaction(tableName, transaction);
+    }
+
+    /**
+     * Check and ensure that the specified statement can only run in a transaction with autocommit context set to true.
+     * */
+    protected void shouldRunInAutoCommitTransaction(String statement)
+    {
+        if (!transactionContext.isAutoCommitContext()) {
+            throw new PrestoException(ICEBERG_TRANSACTION_CONFLICT_ERROR, statement + " cannot be called within a transaction (use autocommit mode) in Iceberg connector.");
+        }
     }
 }

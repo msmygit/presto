@@ -5,7 +5,7 @@
     <parent>
         <groupId>com.facebook.presto</groupId>
         <artifactId>presto-root</artifactId>
-        <version>0.297-SNAPSHOT</version>
+        <version>0.299-SNAPSHOT</version>
     </parent>
 
     <artifactId>presto-bigquery</artifactId>
@@ -174,7 +174,7 @@
 
         <dependency>
             <groupId>com.google.api.grpc</groupId>
-            <artifactId>proto-google-cloud-bigquerystorage-v1beta1</artifactId>
+            <artifactId>proto-google-cloud-bigquerystorage-v1</artifactId>
         </dependency>
 
         <dependency>

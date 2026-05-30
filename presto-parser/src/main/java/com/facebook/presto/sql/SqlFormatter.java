@@ -34,6 +34,8 @@ import com.facebook.presto.sql.tree.CreateRole;
 import com.facebook.presto.sql.tree.CreateSchema;
 import com.facebook.presto.sql.tree.CreateTable;
 import com.facebook.presto.sql.tree.CreateTableAsSelect;
+import com.facebook.presto.sql.tree.CreateTag;
+import com.facebook.presto.sql.tree.CreateVectorIndex;
 import com.facebook.presto.sql.tree.CreateView;
 import com.facebook.presto.sql.tree.Deallocate;
 import com.facebook.presto.sql.tree.Delete;
@@ -72,6 +74,7 @@ import com.facebook.presto.sql.tree.Lateral;
 import com.facebook.presto.sql.tree.LikeClause;
 import com.facebook.presto.sql.tree.Merge;
 import com.facebook.presto.sql.tree.MergeCase;
+import com.facebook.presto.sql.tree.MergeDelete;
 import com.facebook.presto.sql.tree.MergeInsert;
 import com.facebook.presto.sql.tree.MergeUpdate;
 import com.facebook.presto.sql.tree.NaturalJoin;
@@ -100,6 +103,8 @@ import com.facebook.presto.sql.tree.Row;
 import com.facebook.presto.sql.tree.SampledRelation;
 import com.facebook.presto.sql.tree.Select;
 import com.facebook.presto.sql.tree.SelectItem;
+import com.facebook.presto.sql.tree.SetColumnDefault;
+import com.facebook.presto.sql.tree.SetColumnType;
 import com.facebook.presto.sql.tree.SetProperties;
 import com.facebook.presto.sql.tree.SetRole;
 import com.facebook.presto.sql.tree.SetSession;
@@ -757,6 +762,14 @@ public final class SqlFormatter
             return null;
         }
 
+        @Override
+        protected Void visitMergeDelete(MergeDelete node, Integer indent)
+        {
+            appendMergeCaseWhen(true);
+            append(indent + 1, "DELETE");
+            return null;
+        }
+
         private void appendMergeCaseWhen(boolean matched)
         {
             builder.append(matched ? "WHEN MATCHED" : "WHEN NOT MATCHED").append(" THEN\n");
@@ -1030,7 +1043,16 @@ public final class SqlFormatter
 
         protected Void visitSetProperties(SetProperties node, Integer context)
         {
-            builder.append("ALTER TABLE ");
+            switch (node.getType()) {
+                case TABLE:
+                    builder.append("ALTER TABLE ");
+                    break;
+                case MATERIALIZED_VIEW:
+                    builder.append("ALTER MATERIALIZED VIEW ");
+                    break;
+                default:
+                    throw new UnsupportedOperationException("Unsupported SetProperties type: " + node.getType());
+            }
             if (node.isTableExists()) {
                 builder.append("IF EXISTS ");
             }
@@ -1284,6 +1306,36 @@ public final class SqlFormatter
             return null;
         }
 
+        @Override
+        protected Void visitCreateVectorIndex(CreateVectorIndex node, Integer indent)
+        {
+            builder.append("CREATE VECTOR INDEX ");
+            builder.append(formatName(node.getIndexName()));
+            builder.append(" ON ");
+            builder.append(formatName(node.getTableName()));
+            builder.append(" (");
+            builder.append(node.getColumns().stream()
+                    .map(Formatter::formatName)
+                    .collect(joining(", ")));
+            builder.append(")");
+
+            if (!node.getProperties().isEmpty()) {
+                builder.append("\nWITH (");
+                builder.append(node.getProperties().stream()
+                        .map(property -> formatName(property.getName()) + " = " +
+                                formatExpression(property.getValue(), parameters))
+                        .collect(joining(", ")));
+                builder.append(")");
+            }
+
+            node.getUpdatingFor().ifPresent(updatingFor -> {
+                builder.append("\nUPDATING FOR ");
+                builder.append(formatExpression(updatingFor, parameters));
+            });
+
+            return null;
+        }
+
         private String formatPropertiesMultiLine(List<Property> properties)
         {
             if (properties.isEmpty()) {
@@ -1377,6 +1429,8 @@ public final class SqlFormatter
             }
             column.getComment().ifPresent(comment ->
                     sb.append(" COMMENT ").append(formatStringLiteral(comment)));
+            column.getDefaultExpression().ifPresent(defaultExpr ->
+                    sb.append(" DEFAULT ").append(formatExpression(defaultExpr, parameters)));
             sb.append(formatPropertiesSingleLine(column.getProperties()));
             return sb.toString();
         }
@@ -1881,6 +1935,40 @@ public final class SqlFormatter
         }
 
         @Override
+        protected Void visitCreateTag(CreateTag node, Integer indent)
+        {
+            builder.append("ALTER TABLE ");
+            if (node.isTableExists()) {
+                builder.append("IF EXISTS ");
+            }
+            builder.append(formatName(node.getTableName()))
+                    .append(" CREATE ");
+            if (node.isReplace()) {
+                builder.append("OR REPLACE ");
+            }
+            builder.append("TAG ");
+            if (node.isIfNotExists()) {
+                builder.append("IF NOT EXISTS ");
+            }
+            builder.append(formatStringLiteral(node.getTagName()));
+            if (node.getTableVersion().isPresent()) {
+                TableVersionExpression tableVersion = node.getTableVersion().get();
+                builder.append(" FOR ")
+                        .append(tableVersion.getTableVersionType().name())
+                        .append(tableVersion.getTableVersionOperator() == TableVersionExpression.TableVersionOperator.EQUAL ? " AS OF " : " BEFORE ")
+                        .append(formatExpression(tableVersion.getStateExpression(), parameters));
+            }
+
+            if (node.getRetainDays().isPresent()) {
+                builder.append(" RETAIN ")
+                        .append(node.getRetainDays().get())
+                        .append(" DAYS");
+            }
+
+            return null;
+        }
+
+        @Override
         protected Void visitDropBranch(DropBranch node, Integer indent)
         {
             builder.append("ALTER TABLE ");
@@ -1966,6 +2054,21 @@ public final class SqlFormatter
             return null;
         }
 
+        @Override
+        protected Void visitSetColumnDefault(SetColumnDefault node, Integer indent)
+        {
+            builder.append("ALTER TABLE ");
+            if (node.isTableExists()) {
+                builder.append("IF EXISTS ");
+            }
+            builder.append(formatName(node.getTable()));
+            builder.append(" ALTER COLUMN ");
+            builder.append(formatName(node.getColumn()));
+            builder.append(" SET DEFAULT ");
+            process(node.getDefaultExpression(), indent);
+            return null;
+        }
+
         private String processConstraintDefinition(ConstraintSpecification node)
         {
             StringBuilder sb = new StringBuilder();
@@ -2007,6 +2110,21 @@ public final class SqlFormatter
             else {
                 process(relation, indent);
             }
+        }
+
+        @Override
+        protected Void visitSetColumnType(SetColumnType node, Integer context)
+        {
+            builder.append("ALTER TABLE ");
+            if (node.isTableExists()) {
+                builder.append("IF EXISTS ");
+            }
+            builder.append(formatName(node.getTableName()))
+                    .append(" ALTER COLUMN ")
+                    .append(formatName(node.getColumnName()))
+                    .append(" SET DATA TYPE ")
+                    .append(node.getType().toString());
+            return null;
         }
 
         private StringBuilder append(int indent, String value)

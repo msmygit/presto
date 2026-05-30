@@ -15,7 +15,7 @@
 #include <folly/executors/ThreadedExecutor.h>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
-#include "folly/experimental/EventCount.h"
+#include "folly/synchronization/EventCount.h"
 #include "presto_cpp/main/PrestoExchangeSource.h"
 #include "presto_cpp/main/TaskResource.h"
 #include "presto_cpp/main/common/Exception.h"
@@ -112,7 +112,7 @@ class Cursor {
       TaskManager* taskManager,
       const protocol::TaskId& taskId,
       const RowTypePtr& rowType,
-      velox::VectorSerde::Kind serdeKind,
+      const std::string& serdeKind,
       memory::MemoryPool* pool)
       : pool_(pool),
         taskManager_(taskManager),
@@ -178,7 +178,7 @@ class Cursor {
   TaskManager* const taskManager_;
   const protocol::TaskId taskId_;
   const RowTypePtr rowType_;
-  const velox::VectorSerde::Kind serdeKind_;
+  const std::string serdeKind_;
   bool atEnd_{false};
   uint64_t sequence_{0};
 };
@@ -190,14 +190,10 @@ void setAggregationSpillConfig(
 }
 
 class TaskManagerTest : public exec::test::OperatorTestBase,
-                        public testing::WithParamInterface<VectorSerde::Kind> {
+                        public testing::WithParamInterface<std::string> {
  public:
-  static std::vector<VectorSerde::Kind> getTestParams() {
-    const std::vector<VectorSerde::Kind> kinds(
-        {VectorSerde::Kind::kPresto,
-         VectorSerde::Kind::kCompactRow,
-         VectorSerde::Kind::kUnsafeRow});
-    return kinds;
+  static std::vector<std::string> getTestParams() {
+    return {"Presto", "CompactRow", "UnsafeRow"};
   }
 
   static void SetUpTestCase() {
@@ -971,6 +967,91 @@ TEST_P(TaskManagerTest, queuedEmptyGroupedExecutionTask) {
   auto execTask = prestoTask->task;
   if (execTask) {
     ASSERT_EQ(execTask->state(), TaskState::kFinished);
+  }
+}
+
+// Tests that aborting one queued task from a query does not prevent other
+// queued tasks from the same query from being started. This is a regression
+// test for a bug where tasks from different fragments of the same query were
+// grouped in a single queue entry, and aborting any one of them (e.g. because
+// its fragment completed on other workers) would silently discard all the
+// other still-valid tasks in the same entry.
+TEST_P(TaskManagerTest, queuedTaskAbortDoesNotBlockSiblings) {
+  SystemConfig::instance()->setValue(
+      std::string(SystemConfig::kWorkerOverloadedTaskQueuingEnabled), "true");
+
+  // Create two plan fragments representing different stages of the same query.
+  // Both are simple table scans with partitioned output.
+  core::PlanNodeId scanNodeId1;
+  auto planFragment1 = exec::test::PlanBuilder()
+                           .tableScan(rowType_)
+                           .capturePlanNodeId(scanNodeId1)
+                           .partitionedOutput({}, 1, {"c0", "c1"}, GetParam())
+                           .planFragment();
+
+  core::PlanNodeId scanNodeId2;
+  auto planFragment2 = exec::test::PlanBuilder()
+                           .tableScan(rowType_)
+                           .capturePlanNodeId(scanNodeId2)
+                           .partitionedOutput({}, 1, {"c0", "c1"}, GetParam())
+                           .planFragment();
+
+  // Mark server as overloaded so tasks get queued instead of started.
+  taskManager_->setServerOverloaded(true);
+
+  // Use the same query ID but different stage IDs, so that both tasks share the
+  // same queryCtx and are grouped in the same queue entry.
+  const protocol::TaskId taskId1 = "queueAbortQuery.4.0.1.0";
+  const protocol::TaskId taskId2 = "queueAbortQuery.5.0.1.0";
+
+  // Create both tasks with no splits and 'no more splits'.
+  {
+    long splitSequenceId{0};
+    protocol::TaskUpdateRequest updateRequest;
+    updateRequest.sources.push_back(
+        makeSource(scanNodeId1, {}, true, splitSequenceId));
+    createOrUpdateTask(taskId1, updateRequest, planFragment1);
+  }
+  {
+    long splitSequenceId{0};
+    protocol::TaskUpdateRequest updateRequest;
+    updateRequest.sources.push_back(
+        makeSource(scanNodeId2, {}, true, splitSequenceId));
+    createOrUpdateTask(taskId2, updateRequest, planFragment2);
+  }
+
+  // Verify both tasks are queued (not started).
+  auto prestoTask1 = taskManager_->tasks().at(taskId1);
+  auto prestoTask2 = taskManager_->tasks().at(taskId2);
+  ASSERT_FALSE(prestoTask1->taskStarted);
+  ASSERT_FALSE(prestoTask2->taskStarted);
+  ASSERT_EQ(taskManager_->numQueuedTasks(), 2);
+
+  // Simulate the coordinator aborting one task (e.g. its fragment completed on
+  // other workers). This sets the task state to ABORTED but does not remove it
+  // from the queue.
+  taskManager_->deleteTask(taskId1, true, false);
+
+  // Verify task1 is aborted but task2 is still planned.
+  ASSERT_EQ(prestoTask1->info.taskStatus.state, protocol::TaskState::ABORTED);
+  ASSERT_FALSE(prestoTask2->taskStarted);
+
+  // Clear overload and trigger the dequeue.
+  taskManager_->setServerOverloaded(false);
+  taskManager_->maybeStartNextQueuedTask();
+
+  // The key assertion: task2 must have been started despite task1 being
+  // aborted.
+  ASSERT_TRUE(prestoTask2->taskStarted)
+      << "Task from a different stage was not started after its sibling "
+         "was aborted — the aborted task blocked the entire queue entry.";
+
+  // Verify task2 runs to completion.
+  auto results = fetchAllResults(taskId2, rowType_, {taskId2});
+  ASSERT_EQ(results.results.size(), 0);
+  auto execTask2 = prestoTask2->task;
+  if (execTask2) {
+    ASSERT_EQ(execTask2->state(), TaskState::kFinished);
   }
 }
 

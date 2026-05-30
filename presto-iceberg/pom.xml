@@ -4,7 +4,7 @@
     <parent>
         <groupId>com.facebook.presto</groupId>
         <artifactId>presto-root</artifactId>
-        <version>0.297-SNAPSHOT</version>
+        <version>0.299-SNAPSHOT</version>
     </parent>
     <artifactId>presto-iceberg</artifactId>
     <name>presto-iceberg</name>
@@ -14,8 +14,7 @@
     <properties>
         <air.main.basedir>${project.parent.basedir}</air.main.basedir>
         <project.build.targetJdk>17</project.build.targetJdk>
-        <dep.iceberg.version>1.10.0</dep.iceberg.version>
-        <dep.nessie.version>0.103.0</dep.nessie.version>
+        <dep.nessie.version>0.105.0</dep.nessie.version>
         <air.check.skip-modernizer>true</air.check.skip-modernizer>
     </properties>
 
@@ -102,6 +101,13 @@
                     <artifactId>hadoop-client</artifactId>
                 </exclusion>
             </exclusions>
+        </dependency>
+
+        <dependency>
+            <groupId>org.apache.parquet</groupId>
+            <artifactId>parquet-jackson</artifactId>
+            <version>1.17.1</version>
+            <scope>runtime</scope>
         </dependency>
 
         <dependency>
@@ -609,7 +615,7 @@
         <dependency>
             <groupId>jakarta.servlet</groupId>
             <artifactId>jakarta.servlet-api</artifactId>
-            <scope>test</scope>
+            <scope>runtime</scope>
         </dependency>
 
         <dependency>
@@ -672,6 +678,13 @@
         <dependency>
             <groupId>com.facebook.presto</groupId>
             <artifactId>presto-hive</artifactId>
+            <type>test-jar</type>
+            <scope>test</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>com.facebook.presto</groupId>
+            <artifactId>presto-hive-metastore</artifactId>
             <type>test-jar</type>
             <scope>test</scope>
         </dependency>
@@ -848,7 +861,6 @@
                         </rules>
                     </configuration>
                 </plugin>
-
             </plugins>
         </pluginManagement>
     </build>

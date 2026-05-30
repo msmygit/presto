@@ -99,6 +99,12 @@ public abstract class ForwardingConnectorAccessControl
     }
 
     @Override
+    public void checkCanAlterColumn(ConnectorTransactionHandle transactionHandle, ConnectorIdentity identity, AccessControlContext context, SchemaTableName tableName)
+    {
+        delegate().checkCanAlterColumn(transactionHandle, identity, context, tableName);
+    }
+
+    @Override
     public void checkCanRenameTable(ConnectorTransactionHandle transactionHandle, ConnectorIdentity identity, AccessControlContext context, SchemaTableName tableName, SchemaTableName newTableName)
     {
         delegate().checkCanRenameTable(transactionHandle, identity, context, tableName, newTableName);
@@ -288,6 +294,12 @@ public abstract class ForwardingConnectorAccessControl
     public void checkCanCreateBranch(ConnectorTransactionHandle transactionHandle, ConnectorIdentity identity, AccessControlContext context, SchemaTableName tableName)
     {
         delegate().checkCanCreateBranch(transactionHandle, identity, context, tableName);
+    }
+
+    @Override
+    public void checkCanCreateTag(ConnectorTransactionHandle transactionHandle, ConnectorIdentity identity, AccessControlContext context, SchemaTableName tableName)
+    {
+        delegate().checkCanCreateTag(transactionHandle, identity, context, tableName);
     }
 
     @Override

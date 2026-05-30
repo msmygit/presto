@@ -39,11 +39,14 @@ public class NativeWorkerSessionPropertyProvider
     public static final String NATIVE_SPILL_COMPRESSION_CODEC = "native_spill_compression_codec";
     public static final String NATIVE_SPILL_WRITE_BUFFER_SIZE = "native_spill_write_buffer_size";
     public static final String NATIVE_SPILL_FILE_CREATE_CONFIG = "native_spill_file_create_config";
+    public static final String NATIVE_AGGREGATION_SPILL_FILE_CREATE_CONFIG = "native_aggregation_spill_file_create_config";
+    public static final String NATIVE_HASH_JOIN_SPILL_FILE_CREATE_CONFIG = "native_hash_join_spill_file_create_config";
     public static final String NATIVE_JOIN_SPILL_ENABLED = "native_join_spill_enabled";
     public static final String NATIVE_WINDOW_SPILL_ENABLED = "native_window_spill_enabled";
     public static final String NATIVE_WRITER_SPILL_ENABLED = "native_writer_spill_enabled";
     public static final String NATIVE_WRITER_FLUSH_THRESHOLD_BYTES = "native_writer_flush_threshold_bytes";
     public static final String NATIVE_ROW_NUMBER_SPILL_ENABLED = "native_row_number_spill_enabled";
+    public static final String NATIVE_MARK_DISTINCT_SPILL_ENABLED = "native_mark_distinct_spill_enabled";
     public static final String NATIVE_TOPN_ROW_NUMBER_SPILL_ENABLED = "native_topn_row_number_spill_enabled";
     public static final String NATIVE_SPILLER_NUM_PARTITION_BITS = "native_spiller_num_partition_bits";
     public static final String NATIVE_DEBUG_VALIDATE_OUTPUT_FROM_OPERATORS = "native_debug_validate_output_from_operators";
@@ -64,6 +67,7 @@ public class NativeWorkerSessionPropertyProvider
     public static final String NATIVE_MAX_PAGE_PARTITIONING_BUFFER_SIZE = "native_max_page_partitioning_buffer_size";
     public static final String NATIVE_PARTITIONED_OUTPUT_EAGER_FLUSH = "native_partitioned_output_eager_flush";
     public static final String NATIVE_MAX_OUTPUT_BUFFER_SIZE = "native_max_output_buffer_size";
+    public static final String NATIVE_MIN_SHUFFLE_COMPRESSION_PAGE_SIZE_BYTES = "native_min_shuffle_compression_page_size_bytes";
     public static final String NATIVE_QUERY_TRACE_ENABLED = "native_query_trace_enabled";
     public static final String NATIVE_QUERY_TRACE_DIR = "native_query_trace_dir";
     public static final String NATIVE_QUERY_TRACE_NODE_ID = "native_query_trace_node_id";
@@ -91,6 +95,7 @@ public class NativeWorkerSessionPropertyProvider
     public static final String NATIVE_USE_VELOX_GEOSPATIAL_JOIN = "native_use_velox_geospatial_join";
     public static final String NATIVE_AGGREGATION_COMPACTION_BYTES_THRESHOLD = "native_aggregation_compaction_bytes_threshold";
     public static final String NATIVE_AGGREGATION_COMPACTION_UNUSED_MEMORY_RATIO = "native_aggregation_compaction_unused_memory_ratio";
+    public static final String NATIVE_AGGREGATION_MEMORY_COMPACTION_RECLAIM_ENABLED = "native_aggregation_memory_compaction_reclaim_enabled";
     public static final String NATIVE_MERGE_JOIN_OUTPUT_BATCH_START_SIZE = "native_merge_join_output_batch_start_size";
 
     private final List<PropertyMetadata<?>> sessionProperties;
@@ -146,6 +151,20 @@ public class NativeWorkerSessionPropertyProvider
                                 "defined by the underlying file system.",
                         "",
                         !nativeExecution),
+                stringProperty(
+                        NATIVE_AGGREGATION_SPILL_FILE_CREATE_CONFIG,
+                        "Native Execution only. Config used to create aggregation spill files. This config is \n" +
+                                "provided to underlying file system and the config is free form. The form should be\n" +
+                                "defined by the underlying file system.",
+                        "",
+                        !nativeExecution),
+                stringProperty(
+                        NATIVE_HASH_JOIN_SPILL_FILE_CREATE_CONFIG,
+                        "Native Execution only. Config used to create hash join spill files. This config is \n" +
+                                "provided to underlying file system and the config is free form. The form should be\n" +
+                                "defined by the underlying file system.",
+                        "",
+                        !nativeExecution),
                 booleanProperty(
                         NATIVE_JOIN_SPILL_ENABLED,
                         "Native Execution only. Enable join spilling on native engine",
@@ -170,6 +189,11 @@ public class NativeWorkerSessionPropertyProvider
                 booleanProperty(
                         NATIVE_ROW_NUMBER_SPILL_ENABLED,
                         "Native Execution only. Enable row number spilling on native engine",
+                        false,
+                        !nativeExecution),
+                booleanProperty(
+                        NATIVE_MARK_DISTINCT_SPILL_ENABLED,
+                        "Native Execution only. Enable mark distinct spilling on native engine",
                         false,
                         !nativeExecution),
                 booleanProperty(
@@ -325,6 +349,11 @@ public class NativeWorkerSessionPropertyProvider
                         false,
                         !nativeExecution),
                 integerProperty(
+                        NATIVE_MIN_SHUFFLE_COMPRESSION_PAGE_SIZE_BYTES,
+                        "Native Execution only. Minimum serialized page size in bytes to attempt shuffle compression.",
+                        0,
+                        !nativeExecution),
+                integerProperty(
                         NATIVE_MAX_LOCAL_EXCHANGE_PARTITION_COUNT,
                         "Maximum number of partitions created by a local exchange. " +
                                 "Affects concurrency for pipelines containing LocalPartitionNode",
@@ -457,6 +486,13 @@ public class NativeWorkerSessionPropertyProvider
                                 "The value is in the range of [0, 1). NOTE: Currently only applies to approx_most_frequent " +
                                 "aggregate with StringView type during global aggregation.",
                         0.25,
+                        !nativeExecution),
+                booleanProperty(
+                        NATIVE_AGGREGATION_MEMORY_COMPACTION_RECLAIM_ENABLED,
+                        "If true, enables lightweight memory compaction before spilling during " +
+                                "memory reclaim in aggregation. When enabled, the aggregation operator " +
+                                "will try to compact aggregate function state before resorting to spilling.",
+                        false,
                         !nativeExecution),
                 integerProperty(
                         NATIVE_MERGE_JOIN_OUTPUT_BATCH_START_SIZE,

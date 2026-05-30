@@ -88,11 +88,6 @@ public abstract class InternalPlanVisitor<R, C>
         return visitPlan(node, context);
     }
 
-    public R visitTopNRowNumber(TopNRowNumberNode node, C context)
-    {
-        return visitPlan(node, context);
-    }
-
     public R visitExchange(ExchangeNode node, C context)
     {
         return visitPlan(node, context);
@@ -149,6 +144,11 @@ public abstract class InternalPlanVisitor<R, C>
     }
 
     public R visitTableFunctionProcessor(TableFunctionProcessorNode node, C context)
+    {
+        return visitPlan(node, context);
+    }
+
+    public R visitRPC(RPCNode node, C context)
     {
         return visitPlan(node, context);
     }

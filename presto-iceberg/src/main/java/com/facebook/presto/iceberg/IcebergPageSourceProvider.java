@@ -153,6 +153,7 @@ import static com.facebook.presto.iceberg.IcebergErrorCode.ICEBERG_MISSING_COLUM
 import static com.facebook.presto.iceberg.IcebergErrorCode.ICEBERG_MISSING_DATA;
 import static com.facebook.presto.iceberg.IcebergMetadataColumn.MERGE_PARTITION_DATA;
 import static com.facebook.presto.iceberg.IcebergOrcColumn.ROOT_COLUMN_ID;
+import static com.facebook.presto.iceberg.IcebergUtil.deserializePartitionValue;
 import static com.facebook.presto.iceberg.IcebergUtil.getColumns;
 import static com.facebook.presto.iceberg.IcebergUtil.getLocationProvider;
 import static com.facebook.presto.iceberg.IcebergUtil.getShallowWrappedIcebergTable;
@@ -758,10 +759,22 @@ public class IcebergPageSourceProvider
         Map<Integer, HivePartitionKey> partitionKeys = split.getPartitionKeys();
 
         // The update row id and merge target table row id aren't valid columns that can be read from storage.
-        // Filter it out from columns passed to the storage page source.
+        // _row_id and _last_updated_sequence_number are kept in columnsToReadFromStorage so that
+        // the Parquet/ORC reader can read them from the data file when present.
+        // When absent, IcebergUpdateablePageSource applies fallback computation.
         Set<IcebergColumnHandle> columnsToReadFromStorage = icebergColumns.stream()
                 .filter(not(column -> column.isUpdateRowIdColumn() || column.isMergeTargetTableRowIdColumn()))
                 .collect(Collectors.toSet());
+
+        // If _row_id is requested and the file has a valid first_row_id, we need ROW_POSITION to
+        // compute _row_id = firstRowId + _pos as fallback when the file doesn't contain _row_id.
+        // Add it if not already present.
+        boolean rowIdRequested = icebergColumns.stream().anyMatch(IcebergColumnHandle::isRowIdColumn);
+        long firstRowId = split.getFirstRowId();
+        if (rowIdRequested && firstRowId >= 0) {
+            IcebergColumnHandle rowPositionHandle = IcebergColumnHandle.create(ROW_POSITION, typeManager, REGULAR);
+            columnsToReadFromStorage.add(rowPositionHandle);
+        }
 
         // add any additional columns which may need to be read from storage
         // by delete filters
@@ -827,6 +840,7 @@ public class IcebergPageSourceProvider
                         splitContext.isCacheable());
 
         ImmutableMap.Builder<Integer, Object> metadataValues = ImmutableMap.builder();
+        ImmutableMap.Builder<Integer, Object> defaultValues = ImmutableMap.builder();
         for (IcebergColumnHandle icebergColumn : icebergColumns) {
             if (icebergColumn.isPathColumn()) {
                 metadataValues.put(icebergColumn.getColumnIdentity().getId(), utf8Slice(split.getPath()));
@@ -846,6 +860,17 @@ public class IcebergPageSourceProvider
                         Optional<String> partitionDataJson = split.getPartitionDataJson();
                         metadataValues.put(subColumn.getId(), partitionDataJson.isPresent() ? utf8Slice(partitionDataJson.get()) : EMPTY_SLICE);
                     }
+                }
+            }
+            else if (icebergColumn.hasDefaultValue()) {
+                Types.NestedField field = tableSchema.findField(icebergColumn.getId());
+                if (field != null && field.initialDefault() != null) {
+                    String defaultValueString = String.valueOf(field.initialDefault());
+                    Object prestoValue = deserializePartitionValue(
+                            icebergColumn.getType(),
+                            defaultValueString,
+                            icebergColumn.getName());
+                    defaultValues.put(icebergColumn.getId(), prestoValue);
                 }
             }
         }
@@ -926,10 +951,16 @@ public class IcebergPageSourceProvider
                 deleteFilters,
                 updatedRowPageSinkSupplier,
                 table.getUpdatedColumns(),
-                rowIdColumnHandle);
+                rowIdColumnHandle,
+                firstRowId,
+                split.getDataSequenceNumber());
 
         if (split.getChangelogSplitInfo().isPresent()) {
             dataSource = new ChangelogPageSource(dataSource, split.getChangelogSplitInfo().get(), (List<IcebergColumnHandle>) (List<?>) desiredColumns, icebergColumns);
+        }
+        // Wrap with default value page source if there are columns with defaults
+        if (!defaultValues.build().isEmpty()) {
+            dataSource = new IcebergDefaultValuePageSource(dataSource, icebergColumns, defaultValues.build());
         }
         return dataSource;
     }

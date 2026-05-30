@@ -78,6 +78,21 @@ Create a materialized view with INVOKER security mode::
     FROM orders
     GROUP BY date_trunc('day', order_date)
 
+Create a materialized view with staleness configuration::
+
+    CREATE MATERIALIZED VIEW daily_sales
+    WITH (stale_read_behavior = 'FAIL',
+    staleness_window = '1h')
+    AS
+    SELECT date_trunc('day', order_date) AS day,
+           region,
+           SUM(amount) AS total_sales
+    FROM orders
+    GROUP BY date_trunc('day', order_date), region
+
+
+The optional ``staleness_window`` parameter defines how long stale data is acceptable and allows duration values in hours, minutes, or seconds (for example: 1hr, 30m).
+
 Create a materialized view with connector properties::
 
     CREATE MATERIALIZED VIEW partitioned_sales
@@ -94,5 +109,6 @@ Create a materialized view with connector properties::
 See Also
 --------
 
-:doc:`drop-materialized-view`, :doc:`refresh-materialized-view`,
-:doc:`show-create-materialized-view`, :doc:`/admin/materialized-views`
+:doc:`alter-materialized-view`, :doc:`drop-materialized-view`,
+:doc:`refresh-materialized-view`, :doc:`show-create-materialized-view`,
+:doc:`/admin/materialized-views`

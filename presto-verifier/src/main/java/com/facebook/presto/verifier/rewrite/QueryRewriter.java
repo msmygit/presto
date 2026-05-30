@@ -23,7 +23,6 @@ import com.facebook.presto.common.type.Type;
 import com.facebook.presto.common.type.TypeManager;
 import com.facebook.presto.common.type.TypeSignature;
 import com.facebook.presto.common.type.TypeSignatureParameter;
-import com.facebook.presto.sql.SqlFormatter;
 import com.facebook.presto.sql.parser.SqlParser;
 import com.facebook.presto.sql.planner.LiteralEncoder;
 import com.facebook.presto.sql.tree.AllColumns;
@@ -33,15 +32,19 @@ import com.facebook.presto.sql.tree.ComparisonExpression.Operator;
 import com.facebook.presto.sql.tree.CreateTable;
 import com.facebook.presto.sql.tree.CreateTableAsSelect;
 import com.facebook.presto.sql.tree.CreateView;
+import com.facebook.presto.sql.tree.Delete;
 import com.facebook.presto.sql.tree.DropTable;
 import com.facebook.presto.sql.tree.DropView;
 import com.facebook.presto.sql.tree.Expression;
+import com.facebook.presto.sql.tree.ExpressionRewriter;
+import com.facebook.presto.sql.tree.ExpressionTreeRewriter;
 import com.facebook.presto.sql.tree.FunctionCall;
 import com.facebook.presto.sql.tree.Identifier;
 import com.facebook.presto.sql.tree.Insert;
 import com.facebook.presto.sql.tree.IsNullPredicate;
 import com.facebook.presto.sql.tree.LikeClause;
 import com.facebook.presto.sql.tree.LogicalBinaryExpression;
+import com.facebook.presto.sql.tree.Node;
 import com.facebook.presto.sql.tree.Property;
 import com.facebook.presto.sql.tree.QualifiedName;
 import com.facebook.presto.sql.tree.Query;
@@ -51,9 +54,11 @@ import com.facebook.presto.sql.tree.SelectItem;
 import com.facebook.presto.sql.tree.ShowCreate;
 import com.facebook.presto.sql.tree.SingleColumn;
 import com.facebook.presto.sql.tree.Statement;
+import com.facebook.presto.sql.tree.SubqueryExpression;
+import com.facebook.presto.sql.tree.Table;
+import com.facebook.presto.sql.tree.TryExpression;
 import com.facebook.presto.verifier.framework.ClusterType;
 import com.facebook.presto.verifier.framework.Column;
-import com.facebook.presto.verifier.framework.JsonParseSafetyWrapper;
 import com.facebook.presto.verifier.framework.QueryConfiguration;
 import com.facebook.presto.verifier.framework.QueryException;
 import com.facebook.presto.verifier.framework.QueryObjectBundle;
@@ -111,7 +116,27 @@ import static java.util.UUID.randomUUID;
 
 public class QueryRewriter
 {
-    private static final com.facebook.airlift.log.Logger log = com.facebook.airlift.log.Logger.get(QueryRewriter.class);
+    private static final class SubstitutedStatement<T extends Statement>
+    {
+        private final T statement;
+        private final Optional<String> functionSubstitutions;
+
+        public SubstitutedStatement(T statement, Optional<String> functionSubstitutions)
+        {
+            this.statement = requireNonNull(statement, "statement is null");
+            this.functionSubstitutions = requireNonNull(functionSubstitutions, "functionSubstitutions is null");
+        }
+
+        public T getStatement()
+        {
+            return statement;
+        }
+
+        public Optional<String> getFunctionSubstitutions()
+        {
+            return functionSubstitutions;
+        }
+    }
 
     private final SqlParser sqlParser;
     private final TypeManager typeManager;
@@ -121,6 +146,7 @@ public class QueryRewriter
     private final Map<ClusterType, List<Property>> tableProperties;
     private final Map<ClusterType, Boolean> reuseTables;
     private final Optional<FunctionCallRewriter> functionCallRewriter;
+    private final boolean jsonParseSafetyWrapperEnabled;
 
     public QueryRewriter(
             SqlParser sqlParser,
@@ -131,7 +157,7 @@ public class QueryRewriter
             Map<ClusterType, List<Property>> tableProperties,
             Map<ClusterType, Boolean> reuseTables)
     {
-        this(sqlParser, typeManager, blockEncodingSerde, prestoAction, tablePrefixes, tableProperties, reuseTables, ImmutableMultimap.of());
+        this(sqlParser, typeManager, blockEncodingSerde, prestoAction, tablePrefixes, tableProperties, reuseTables, ImmutableMultimap.of(), false);
     }
 
     public QueryRewriter(
@@ -144,6 +170,20 @@ public class QueryRewriter
             Map<ClusterType, Boolean> reuseTables,
             Multimap<String, FunctionCallSubstitute> functionSubstitutes)
     {
+        this(sqlParser, typeManager, blockEncodingSerde, prestoAction, tablePrefixes, tableProperties, reuseTables, functionSubstitutes, false);
+    }
+
+    public QueryRewriter(
+            SqlParser sqlParser,
+            TypeManager typeManager,
+            BlockEncodingSerde blockEncodingSerde,
+            PrestoAction prestoAction,
+            Map<ClusterType, QualifiedName> tablePrefixes,
+            Map<ClusterType, List<Property>> tableProperties,
+            Map<ClusterType, Boolean> reuseTables,
+            Multimap<String, FunctionCallSubstitute> functionSubstitutes,
+            boolean jsonParseSafetyWrapperEnabled)
+    {
         this.sqlParser = requireNonNull(sqlParser, "sqlParser is null");
         this.typeManager = requireNonNull(typeManager, "typeManager is null");
         this.blockEncodingSerde = requireNonNull(blockEncodingSerde, "blockEncodingSerge");
@@ -152,26 +192,64 @@ public class QueryRewriter
         this.tableProperties = ImmutableMap.copyOf(tableProperties);
         this.reuseTables = ImmutableMap.copyOf(reuseTables);
         this.functionCallRewriter = FunctionCallRewriter.getInstance(functionSubstitutes, typeManager);
+        this.jsonParseSafetyWrapperEnabled = jsonParseSafetyWrapperEnabled;
     }
 
     /**
-     * Helper method to apply json_parse safety wrapper to a query.
-     * Wraps json_parse() calls with TRY() to handle malformed JSON gracefully.
-     * If re-parsing fails, returns the original query unchanged.
+     * Wraps bare json_parse() calls with TRY() using AST rewriting.
+     * Operates directly on the AST to avoid fragile SQL format/re-parse round-trips
+     * that silently fail on complex queries with lambdas or internal function patterns.
      */
-    private Query applyJsonParseSafetyWrapper(Query query)
+    private static <T extends Statement> T applyJsonParseSafetyWrapper(T query)
     {
-        try {
-            String sql = SqlFormatter.formatSql(query, Optional.empty());
-            String fixedSql = JsonParseSafetyWrapper.wrapUnsafeJsonParse(sql);
-            if (!sql.equals(fixedSql)) {
-                return (Query) sqlParser.createStatement(fixedSql, PARSING_OPTIONS);
-            }
+        return (T) new JsonParseTryWrapper().process(query, null);
+    }
+
+    /**
+     * AST-level rewriter that wraps json_parse() FunctionCall nodes in TryExpression.
+     * Uses the same DefaultTreeRewriter + ExpressionTreeRewriter pattern as FunctionCallRewriter.
+     */
+    private static class JsonParseTryWrapper
+            extends DefaultTreeRewriter<Void>
+    {
+        @Override
+        protected Node visitExpression(Expression node, Void context)
+        {
+            JsonParseTryWrapper statementRewriter = this;
+
+            return ExpressionTreeRewriter.rewriteWith(new ExpressionRewriter<Boolean>()
+            {
+                @Override
+                public Expression rewriteFunctionCall(FunctionCall original, Boolean insideTry, ExpressionTreeRewriter<Boolean> treeRewriter)
+                {
+                    FunctionCall defaultRewrite = treeRewriter.defaultRewrite(original, false);
+                    if (defaultRewrite.getName().getSuffix().equalsIgnoreCase("json_parse") && !Boolean.TRUE.equals(insideTry)) {
+                        return new TryExpression(defaultRewrite);
+                    }
+                    return defaultRewrite;
+                }
+
+                @Override
+                public Expression rewriteTryExpression(TryExpression original, Boolean insideTry, ExpressionTreeRewriter<Boolean> treeRewriter)
+                {
+                    Expression inner = treeRewriter.rewrite(original.getInnerExpression(), true);
+                    if (inner != original.getInnerExpression()) {
+                        return new TryExpression(inner);
+                    }
+                    return original;
+                }
+
+                @Override
+                public Expression rewriteSubqueryExpression(SubqueryExpression expression, Boolean insideTry, ExpressionTreeRewriter<Boolean> treeRewriter)
+                {
+                    Node rewritten = statementRewriter.process(expression.getQuery(), null);
+                    if (expression.getQuery() == rewritten) {
+                        return expression;
+                    }
+                    return new SubqueryExpression((Query) rewritten);
+                }
+            }, node, false);
         }
-        catch (Exception e) {
-            log.warn(e, "Failed to apply json_parse safety wrapper, using original query");
-        }
-        return query;
     }
 
     public QueryObjectBundle rewriteQuery(@Language("SQL") String query, QueryConfiguration queryConfiguration, ClusterType clusterType)
@@ -190,190 +268,244 @@ public class QueryRewriter
 
         if (statement instanceof CreateTableAsSelect) {
             CreateTableAsSelect createTableAsSelect = (CreateTableAsSelect) statement;
-            Query createQuery = createTableAsSelect.getQuery();
-
-            Optional<String> functionSubstitutions = Optional.empty();
-            if (functionCallRewriter.isPresent()) {
-                FunctionCallRewriter.RewriterResult rewriterResult = functionCallRewriter.get().rewrite(createQuery);
-                createQuery = (Query) rewriterResult.getRewrittenNode();
-                functionSubstitutions = rewriterResult.getSubstitutions();
-
-                // Apply safety wrapper for json_parse() calls to prevent failures on malformed JSON
-                createQuery = applyJsonParseSafetyWrapper(createQuery);
-            }
-            if (shouldReuseTable && !functionSubstitutions.isPresent()) {
-                Optional<Expression> partitionsPredicate = getPartitionsPredicate(createTableAsSelect.getName(), queryConfiguration.getPartitions());
-                if (partitionsPredicate.isPresent()) {
-                    return new QueryObjectBundle(
-                            createTableAsSelect.getName(),
-                            ImmutableList.of(),
-                            createTableAsSelect,
-                            ImmutableList.of(),
-                            clusterType,
-                            Optional.empty(),
-                            partitionsPredicate,
-                            true);
-                }
-            }
-
-            QualifiedName temporaryTableName = generateTemporaryName(Optional.of(createTableAsSelect.getName()), prefix);
-            return new QueryObjectBundle(
-                    temporaryTableName,
-                    ImmutableList.of(),
-                    new CreateTableAsSelect(
-                            temporaryTableName,
-                            createQuery,
-                            createTableAsSelect.isNotExists(),
-                            applyPropertyOverride(createTableAsSelect.getProperties(), properties),
-                            createTableAsSelect.isWithData(),
-                            createTableAsSelect.getColumnAliases(),
-                            createTableAsSelect.getComment()),
-                    ImmutableList.of(new DropTable(temporaryTableName, true)),
-                    clusterType,
-                    functionSubstitutions,
-                    Optional.empty(),
-                    false);
+            return rewriteCreateTableAsSelect(createTableAsSelect, queryConfiguration, clusterType, shouldReuseTable, prefix, properties);
         }
         if (statement instanceof Insert) {
             Insert insert = (Insert) statement;
-            QualifiedName originalTableName = insert.getTarget();
-            Query insertQuery = insert.getQuery();
-
-            Optional<String> functionSubstitutions = Optional.empty();
-            if (functionCallRewriter.isPresent()) {
-                FunctionCallRewriter.RewriterResult rewriterResult = functionCallRewriter.get().rewrite(insertQuery);
-                insertQuery = (Query) rewriterResult.getRewrittenNode();
-                functionSubstitutions = rewriterResult.getSubstitutions();
-
-                // Apply safety wrapper for json_parse() calls
-                insertQuery = applyJsonParseSafetyWrapper(insertQuery);
-            }
-            if (shouldReuseTable && !functionSubstitutions.isPresent()) {
-                Optional<Expression> partitionsPredicate = getPartitionsPredicate(originalTableName, queryConfiguration.getPartitions());
-                if (partitionsPredicate.isPresent()) {
-                    return new QueryObjectBundle(
-                            originalTableName,
-                            ImmutableList.of(),
-                            insert,
-                            ImmutableList.of(),
-                            clusterType,
-                            Optional.empty(),
-                            partitionsPredicate,
-                            true);
-                }
-            }
-
-            QualifiedName temporaryTableName = generateTemporaryName(Optional.of(originalTableName), prefix);
-            return new QueryObjectBundle(
-                    temporaryTableName,
-                    ImmutableList.of(
-                            new CreateTable(
-                                    temporaryTableName,
-                                    ImmutableList.of(new LikeClause(originalTableName, Optional.of(INCLUDING))),
-                                    false,
-                                    properties,
-                                    Optional.empty())),
-                    new Insert(
-                            temporaryTableName,
-                            insert.getColumns(),
-                            insertQuery),
-                    ImmutableList.of(new DropTable(temporaryTableName, true)),
-                    clusterType,
-                    functionSubstitutions,
-                    Optional.empty(),
-                    false);
+            return rewriteInsert(insert, queryConfiguration, clusterType, shouldReuseTable, prefix, properties);
         }
         if (statement instanceof Query) {
             Query queryBody = (Query) statement;
-
-            Optional<String> functionSubstitutions = Optional.empty();
-            if (functionCallRewriter.isPresent()) {
-                FunctionCallRewriter.RewriterResult rewriterResult = functionCallRewriter.get().rewrite(queryBody);
-                queryBody = (Query) rewriterResult.getRewrittenNode();
-                functionSubstitutions = rewriterResult.getSubstitutions();
-
-                // Apply safety wrapper for json_parse() calls
-                queryBody = applyJsonParseSafetyWrapper(queryBody);
-            }
-
-            QualifiedName temporaryTableName = generateTemporaryName(Optional.empty(), prefix);
-            ResultSetMetaData metadata = getResultMetadata(queryBody);
-            List<Identifier> columnAliases = generateStorageColumnAliases(metadata);
-            queryBody = rewriteNonStorableColumns(queryBody, metadata);
-            return new QueryObjectBundle(
-                    temporaryTableName,
-                    ImmutableList.of(),
-                    new CreateTableAsSelect(
-                            temporaryTableName,
-                            queryBody,
-                            false,
-                            properties,
-                            true,
-                            Optional.of(columnAliases),
-                            Optional.empty()),
-                    ImmutableList.of(new DropTable(temporaryTableName, true)),
-                    clusterType,
-                    functionSubstitutions,
-                    Optional.empty(),
-                    false);
+            return rewriteQuery(queryBody, queryConfiguration, clusterType, shouldReuseTable, prefix, properties);
         }
         if (statement instanceof CreateView) {
             CreateView createView = (CreateView) statement;
-            QualifiedName temporaryViewName = generateTemporaryName(Optional.empty(), prefix);
-            ImmutableList.Builder<Statement> setupQueries = ImmutableList.builder();
-
-            // Check to see if there is an existing view with the specified view name.
-            // If view exists, create a temporary view that are has the same definition as the existing view.
-            // Otherwise, do not pre-create temporary view.
-            try {
-                String createExistingViewQuery = getOnlyElement(prestoAction.execute(
-                        new ShowCreate(VIEW, createView.getName()),
-                        REWRITE,
-                        SHOW_CREATE_VIEW_CONVERTER).getResults());
-                CreateView createExistingView = (CreateView) sqlParser.createStatement(createExistingViewQuery, PARSING_OPTIONS);
-                setupQueries.add(new CreateView(
-                        temporaryViewName,
-                        createExistingView.getQuery(),
-                        false,
-                        createExistingView.getSecurity()));
-            }
-            catch (QueryException e) {
-                // no-op
-            }
-            return new QueryObjectBundle(
-                    temporaryViewName,
-                    setupQueries.build(),
-                    new CreateView(
-                            temporaryViewName,
-                            createView.getQuery(),
-                            createView.isReplace(),
-                            createView.getSecurity()),
-                    ImmutableList.of(new DropView(temporaryViewName, true)),
-                    clusterType,
-                    Optional.empty(),
-                    Optional.empty(),
-                    false);
+            return rewriteCreateView(createView, queryConfiguration, clusterType, shouldReuseTable, prefix, properties);
         }
         if (statement instanceof CreateTable) {
             CreateTable createTable = (CreateTable) statement;
-            QualifiedName temporaryTableName = generateTemporaryName(Optional.empty(), prefix);
-            return new QueryObjectBundle(
-                    temporaryTableName,
-                    ImmutableList.of(),
-                    new CreateTable(
-                            temporaryTableName,
-                            createTable.getElements(),
-                            createTable.isNotExists(),
-                            applyPropertyOverride(createTable.getProperties(), properties),
-                            createTable.getComment()),
-                    ImmutableList.of(new DropTable(temporaryTableName, true)),
-                    clusterType,
-                    Optional.empty(),
-                    Optional.empty(),
-                    false);
+            return rewriteCreateTable(createTable, queryConfiguration, clusterType, shouldReuseTable, prefix, properties);
+        }
+        if (statement instanceof Delete) {
+            Delete delete = (Delete) statement;
+            return rewriteDelete(delete, queryConfiguration, clusterType, shouldReuseTable, prefix, properties);
         }
 
         throw new IllegalStateException(format("Unsupported query type: %s", statement.getClass()));
+    }
+
+    protected QueryObjectBundle rewriteCreateTableAsSelect(CreateTableAsSelect createTableAsSelect, QueryConfiguration queryConfiguration, ClusterType clusterType, boolean shouldReuseTable, QualifiedName prefix, List<Property> properties)
+    {
+        SubstitutedStatement<Query> substitutedQuery = rewriteQueryFunctions(createTableAsSelect.getQuery());
+        Query createQuery = substitutedQuery.getStatement();
+        Optional<String> functionSubstitutions = substitutedQuery.getFunctionSubstitutions();
+
+        if (shouldReuseTable && !functionSubstitutions.isPresent()) {
+            Optional<Expression> partitionsPredicate = getPartitionsPredicate(createTableAsSelect.getName(), queryConfiguration.getPartitions());
+            if (partitionsPredicate.isPresent()) {
+                return new QueryObjectBundle(
+                        createTableAsSelect.getName(),
+                        ImmutableList.of(),
+                        createTableAsSelect,
+                        ImmutableList.of(),
+                        clusterType,
+                        Optional.empty(),
+                        partitionsPredicate,
+                        true);
+            }
+        }
+
+        QualifiedName temporaryTableName = generateTemporaryName(Optional.of(createTableAsSelect.getName()), prefix);
+        return new QueryObjectBundle(
+                temporaryTableName,
+                ImmutableList.of(),
+                new CreateTableAsSelect(
+                        temporaryTableName,
+                        createQuery,
+                        createTableAsSelect.isNotExists(),
+                        applyPropertyOverride(createTableAsSelect.getProperties(), properties),
+                        createTableAsSelect.isWithData(),
+                        createTableAsSelect.getColumnAliases(),
+                        createTableAsSelect.getComment()),
+                ImmutableList.of(new DropTable(temporaryTableName, true)),
+                clusterType,
+                functionSubstitutions,
+                Optional.empty(),
+                false);
+    }
+
+    protected QueryObjectBundle rewriteInsert(Insert insert, QueryConfiguration queryConfiguration, ClusterType clusterType, boolean shouldReuseTable, QualifiedName prefix, List<Property> properties)
+    {
+        QualifiedName originalTableName = insert.getTarget();
+        SubstitutedStatement<Query> substitutedQuery = rewriteQueryFunctions(insert.getQuery());
+        Query insertQuery = substitutedQuery.getStatement();
+        Optional<String> functionSubstitutions = substitutedQuery.getFunctionSubstitutions();
+
+        if (shouldReuseTable && !functionSubstitutions.isPresent()) {
+            Optional<Expression> partitionsPredicate = getPartitionsPredicate(originalTableName, queryConfiguration.getPartitions());
+            if (partitionsPredicate.isPresent()) {
+                return new QueryObjectBundle(
+                        originalTableName,
+                        ImmutableList.of(),
+                        insert,
+                        ImmutableList.of(),
+                        clusterType,
+                        Optional.empty(),
+                        partitionsPredicate,
+                        true);
+            }
+        }
+
+        QualifiedName temporaryTableName = generateTemporaryName(Optional.of(originalTableName), prefix);
+        return new QueryObjectBundle(
+                temporaryTableName,
+                ImmutableList.of(
+                        new CreateTable(
+                                temporaryTableName,
+                                ImmutableList.of(new LikeClause(originalTableName, Optional.of(INCLUDING))),
+                                false,
+                                properties,
+                                Optional.empty())),
+                new Insert(
+                        temporaryTableName,
+                        insert.getColumns(),
+                        insertQuery),
+                ImmutableList.of(new DropTable(temporaryTableName, true)),
+                clusterType,
+                functionSubstitutions,
+                Optional.empty(),
+                false);
+    }
+
+    protected QueryObjectBundle rewriteQuery(Query queryBody, QueryConfiguration queryConfiguration, ClusterType clusterType, boolean shouldReuseTable, QualifiedName prefix, List<Property> properties)
+    {
+        SubstitutedStatement<Query> substitutedQuery = rewriteQueryFunctions(queryBody);
+        queryBody = substitutedQuery.getStatement();
+        Optional<String> functionSubstitutions = substitutedQuery.getFunctionSubstitutions();
+
+        QualifiedName temporaryTableName = generateTemporaryName(Optional.empty(), prefix);
+        ResultSetMetaData metadata = getResultMetadata(queryBody);
+        List<Identifier> columnAliases = generateStorageColumnAliases(metadata);
+        queryBody = rewriteNonStorableColumns(queryBody, metadata);
+        return new QueryObjectBundle(
+                temporaryTableName,
+                ImmutableList.of(),
+                new CreateTableAsSelect(
+                        temporaryTableName,
+                        queryBody,
+                        false,
+                        properties,
+                        true,
+                        Optional.of(columnAliases),
+                        Optional.empty()),
+                ImmutableList.of(new DropTable(temporaryTableName, true)),
+                clusterType,
+                functionSubstitutions,
+                Optional.empty(),
+                false);
+    }
+
+    protected QueryObjectBundle rewriteCreateView(CreateView createView, QueryConfiguration queryConfiguration, ClusterType clusterType, boolean shouldReuseTable, QualifiedName prefix, List<Property> properties)
+    {
+        QualifiedName temporaryViewName = generateTemporaryName(Optional.empty(), prefix);
+        ImmutableList.Builder<Statement> setupQueries = ImmutableList.builder();
+
+        // Check to see if there is an existing view with the specified view name.
+        // If view exists, create a temporary view that are has the same definition as the existing view.
+        // Otherwise, do not pre-create temporary view.
+        try {
+            String createExistingViewQuery = getOnlyElement(prestoAction.execute(
+                    new ShowCreate(VIEW, createView.getName()),
+                    REWRITE,
+                    SHOW_CREATE_VIEW_CONVERTER).getResults());
+            CreateView createExistingView = (CreateView) sqlParser.createStatement(createExistingViewQuery, PARSING_OPTIONS);
+            setupQueries.add(new CreateView(
+                    temporaryViewName,
+                    createExistingView.getQuery(),
+                    false,
+                    createExistingView.getSecurity()));
+        }
+        catch (QueryException e) {
+            // no-op
+        }
+        return new QueryObjectBundle(
+                temporaryViewName,
+                setupQueries.build(),
+                new CreateView(
+                        temporaryViewName,
+                        createView.getQuery(),
+                        createView.isReplace(),
+                        createView.getSecurity()),
+                ImmutableList.of(new DropView(temporaryViewName, true)),
+                clusterType,
+                Optional.empty(),
+                Optional.empty(),
+                false);
+    }
+
+    protected QueryObjectBundle rewriteCreateTable(CreateTable createTable, QueryConfiguration queryConfiguration, ClusterType clusterType, boolean shouldReuseTable, QualifiedName prefix, List<Property> properties)
+    {
+        QualifiedName temporaryTableName = generateTemporaryName(Optional.empty(), prefix);
+        return new QueryObjectBundle(
+                temporaryTableName,
+                ImmutableList.of(),
+                new CreateTable(
+                        temporaryTableName,
+                        createTable.getElements(),
+                        createTable.isNotExists(),
+                        applyPropertyOverride(createTable.getProperties(), properties),
+                        createTable.getComment()),
+                ImmutableList.of(new DropTable(temporaryTableName, true)),
+                clusterType,
+                Optional.empty(),
+                Optional.empty(),
+                false);
+    }
+
+    protected QueryObjectBundle rewriteDelete(Delete delete, QueryConfiguration queryConfiguration, ClusterType clusterType, boolean shouldReuseTable, QualifiedName prefix, List<Property> properties)
+    {
+        Query selectQuery = getSelectFromDelete(delete, queryConfiguration);
+        SubstitutedStatement<Delete> substitutedDelete = rewriteQueryFunctions(delete);
+        delete = substitutedDelete.getStatement();
+        Optional<String> functionSubstitutions = substitutedDelete.getFunctionSubstitutions();
+        SubstitutedStatement<Query> substitutedSelect = rewriteQueryFunctions(selectQuery);
+        selectQuery = substitutedSelect.getStatement();
+
+        QualifiedName temporaryTableName = generateTemporaryName(Optional.of(delete.getTable().getName()), prefix);
+        return new QueryObjectBundle(
+                temporaryTableName,
+                ImmutableList.of(
+                        new CreateTableAsSelect(
+                                temporaryTableName,
+                                selectQuery,
+                                false,
+                                properties,
+                                true,
+                                Optional.empty(),
+                                Optional.empty())),
+                new Delete(
+                        new Table(temporaryTableName),
+                        delete.getWhere()),
+                ImmutableList.of(new DropTable(temporaryTableName, true)),
+                clusterType,
+                functionSubstitutions,
+                Optional.empty(),
+                false);
+    }
+
+    protected Query getSelectFromDelete(Delete delete, QueryConfiguration queryConfiguration)
+    {
+        Optional<Expression> partitionsPredicate = getPartitionsPredicate(delete.getTable().getName(), queryConfiguration.getPartitions());
+        QuerySpecification spec = new QuerySpecification(
+                new Select(false, ImmutableList.of(new AllColumns())),
+                Optional.of(delete.getTable()),
+                partitionsPredicate,
+                Optional.empty(),
+                Optional.empty(),
+                Optional.empty(),
+                Optional.empty(),
+                Optional.empty());
+        return new Query(Optional.empty(), spec, Optional.empty(), Optional.empty(), Optional.empty());
     }
 
     private QualifiedName generateTemporaryName(Optional<QualifiedName> originalName, QualifiedName prefix)
@@ -433,6 +565,22 @@ public class QueryRewriter
             zeroRowQuery = new Query(query.getWith(), query.getQueryBody(), Optional.empty(), Optional.empty(), Optional.of("0"));
         }
         return prestoAction.execute(zeroRowQuery, REWRITE, ResultSetConverter.DEFAULT).getMetadata();
+    }
+
+    private <T extends Statement> SubstitutedStatement<T> rewriteQueryFunctions(T query)
+    {
+        Optional<String> functionSubstitutions = Optional.empty();
+        if (functionCallRewriter.isPresent()) {
+            FunctionCallRewriter.RewriterResult rewriterResult = functionCallRewriter.get().rewrite(query);
+            query = (T) rewriterResult.getRewrittenNode();
+            functionSubstitutions = rewriterResult.getSubstitutions();
+        }
+        // Apply safety wrapper for json_parse() calls to prevent failures on malformed JSON
+        if (jsonParseSafetyWrapperEnabled) {
+            query = applyJsonParseSafetyWrapper(query);
+        }
+
+        return new SubstitutedStatement<>(query, functionSubstitutions);
     }
 
     private Query rewriteNonStorableColumns(Query query, ResultSetMetaData metadata)

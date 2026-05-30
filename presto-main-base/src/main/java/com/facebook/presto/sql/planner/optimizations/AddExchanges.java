@@ -56,6 +56,7 @@ import com.facebook.presto.spi.plan.TableFinishNode;
 import com.facebook.presto.spi.plan.TableScanNode;
 import com.facebook.presto.spi.plan.TableWriterNode;
 import com.facebook.presto.spi.plan.TopNNode;
+import com.facebook.presto.spi.plan.TopNRowNumberNode;
 import com.facebook.presto.spi.plan.UnionNode;
 import com.facebook.presto.spi.plan.UnnestNode;
 import com.facebook.presto.spi.plan.ValuesNode;
@@ -80,12 +81,12 @@ import com.facebook.presto.sql.planner.plan.GroupIdNode;
 import com.facebook.presto.sql.planner.plan.InternalPlanVisitor;
 import com.facebook.presto.sql.planner.plan.LateralJoinNode;
 import com.facebook.presto.sql.planner.plan.MergeWriterNode;
+import com.facebook.presto.sql.planner.plan.RPCNode;
 import com.facebook.presto.sql.planner.plan.RowNumberNode;
 import com.facebook.presto.sql.planner.plan.SequenceNode;
 import com.facebook.presto.sql.planner.plan.StatisticsWriterNode;
 import com.facebook.presto.sql.planner.plan.TableFunctionNode;
 import com.facebook.presto.sql.planner.plan.TableFunctionProcessorNode;
-import com.facebook.presto.sql.planner.plan.TopNRowNumberNode;
 import com.facebook.presto.sql.planner.plan.UpdateNode;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.cache.CacheBuilder;
@@ -121,6 +122,7 @@ import static com.facebook.presto.SystemSessionProperties.getPartialMergePushdow
 import static com.facebook.presto.SystemSessionProperties.getPartitioningProviderCatalog;
 import static com.facebook.presto.SystemSessionProperties.getRemoteFunctionFixedParallelismTaskCount;
 import static com.facebook.presto.SystemSessionProperties.getRemoteFunctionNamesForFixedParallelism;
+import static com.facebook.presto.SystemSessionProperties.getRpcFunctionParallelism;
 import static com.facebook.presto.SystemSessionProperties.getTableScanShuffleParallelismThreshold;
 import static com.facebook.presto.SystemSessionProperties.getTableScanShuffleStrategy;
 import static com.facebook.presto.SystemSessionProperties.getTaskPartitionedWriterCount;
@@ -280,10 +282,10 @@ public class AddExchanges
                             .anyMatch(x -> pattern.matcher(((CallExpression) x).getFunctionHandle().getName()).matches())) {
                         int taskCount = getRemoteFunctionFixedParallelismTaskCount(session);
                         checkState(taskCount > 0, "taskCount should be larger than 0");
-                        PlanNode newNode = roundRobinExchange(idAllocator.getNextId(), REMOTE_STREAMING, planWithProperties.getNode(), taskCount);
-                        newNode = ChildReplacer.replaceChildren(node, ImmutableList.of(newNode));
-                        newNode = roundRobinExchange(idAllocator.getNextId(), REMOTE_STREAMING, newNode);
-                        return new PlanWithProperties(newNode, derivePropertiesRecursively(newNode));
+                        PlanNode exchangeNode = roundRobinExchange(idAllocator.getNextId(), REMOTE_STREAMING, planWithProperties.getNode(), taskCount);
+                        ActualProperties exchangeProperties = deriveProperties(exchangeNode, planWithProperties.getProperties());
+                        PlanNode newNode = ChildReplacer.replaceChildren(node, ImmutableList.of(exchangeNode));
+                        return new PlanWithProperties(newNode, deriveProperties(newNode, exchangeProperties));
                     }
                 }
             }
@@ -863,6 +865,21 @@ public class AddExchanges
         public PlanWithProperties visitMergeWriter(MergeWriterNode node, PreferredProperties preferredProperties)
         {
             return getTableWriterPlanWithProperties(node, preferredProperties, Optional.empty(), false);
+        }
+
+        @Override
+        public PlanWithProperties visitRPC(RPCNode node, PreferredProperties preferredProperties)
+        {
+            PlanWithProperties source = accept(node.getSource(), preferredProperties);
+
+            int taskCount = getRpcFunctionParallelism(session);
+            if (taskCount > 1) {
+                PlanNode newNode = roundRobinExchange(idAllocator.getNextId(), REMOTE_STREAMING, source.getNode(), taskCount);
+                newNode = ChildReplacer.replaceChildren(node, ImmutableList.of(newNode));
+                return new PlanWithProperties(newNode, derivePropertiesRecursively(newNode));
+            }
+
+            return rebaseAndDeriveProperties(node, source);
         }
 
         @Override

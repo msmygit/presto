@@ -54,6 +54,7 @@ struct IcebergColumnHandle : public ColumnHandle {
   std::shared_ptr<String> comment = {};
   hive::ColumnType columnType = {};
   List<Subfield> requiredSubfields = {};
+  std::shared_ptr<String> defaultValue = {};
 
   IcebergColumnHandle() noexcept;
 
@@ -83,7 +84,7 @@ extern void to_json(json& j, const FileContent& e);
 extern void from_json(const json& j, FileContent& e);
 } // namespace facebook::presto::protocol::iceberg
 namespace facebook::presto::protocol::iceberg {
-enum class FileFormat { ORC, PARQUET, AVRO, METADATA };
+enum class FileFormat { ORC, PARQUET, AVRO, METADATA, PUFFIN };
 extern void to_json(json& j, const FileFormat& e);
 extern void from_json(const json& j, FileFormat& e);
 } // namespace facebook::presto::protocol::iceberg
@@ -124,6 +125,7 @@ struct IcebergTableName {
   String tableName = {};
   IcebergTableType tableType = {};
   std::shared_ptr<Long> snapshotId = {};
+  std::shared_ptr<String> branchName = {};
   std::shared_ptr<Long> changelogEndSnapshot = {};
 };
 void to_json(json& j, const IcebergTableName& p);
@@ -268,6 +270,7 @@ struct IcebergInsertTableHandle : public ConnectorInsertTableHandle {
   Map<String, String> storageProperties = {};
   List<SortField> sortOrder = {};
   std::shared_ptr<SchemaTableName> materializedViewName = {};
+  bool fullRefreshRequired = {};
 
   IcebergInsertTableHandle() noexcept;
 };
@@ -313,6 +316,7 @@ struct IcebergSplit : public ConnectorSplit {
   List<DeleteFile> deletes = {};
   std::shared_ptr<ChangelogSplitInfo> changelogSplitInfo = {};
   int64_t dataSequenceNumber = {};
+  int64_t firstRowId = -1;
   int64_t affinitySchedulingSectionSize = {};
 
   IcebergSplit() noexcept;

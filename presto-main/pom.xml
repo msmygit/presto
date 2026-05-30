@@ -5,7 +5,7 @@
     <parent>
         <groupId>com.facebook.presto</groupId>
         <artifactId>presto-root</artifactId>
-        <version>0.297-SNAPSHOT</version>
+        <version>0.299-SNAPSHOT</version>
     </parent>
 
     <artifactId>presto-main</artifactId>
@@ -311,7 +311,6 @@
         <dependency>
             <groupId>io.projectreactor</groupId>
             <artifactId>reactor-core</artifactId>
-            <version>3.8.0-M2</version>
         </dependency>
 
         <dependency>
@@ -395,6 +394,12 @@
         <dependency>
             <groupId>net.minidev</groupId>
             <artifactId>json-smart</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>com.facebook.presto</groupId>
+            <artifactId>presto-internal-communication</artifactId>
+            <version>${project.version}</version>
         </dependency>
 
         <!-- Testing dependencies -->

@@ -47,7 +47,6 @@ velox::dwio::common::FileFormat toVeloxFileFormat(
 std::unique_ptr<velox::connector::ConnectorTableHandle> toIcebergTableHandle(
     const protocol::TupleDomain<protocol::Subfield>& domainPredicate,
     const std::shared_ptr<protocol::RowExpression>& remainingPredicate,
-    bool isPushdownFilterEnabled,
     const std::string& tableName,
     const protocol::List<protocol::Column>& dataColumns,
     const protocol::TableHandle& tableHandle,
@@ -100,7 +99,6 @@ std::unique_ptr<velox::connector::ConnectorTableHandle> toIcebergTableHandle(
   return std::make_unique<velox::connector::hive::HiveTableHandle>(
       tableHandle.connectorId,
       tableName,
-      isPushdownFilterEnabled,
       std::move(subfieldFilters),
       remainingFilter,
       finalDataColumns,
@@ -244,11 +242,10 @@ IcebergPrestoToVeloxConnector::toVeloxColumnHandle(
   //  constructor similar to how Hive Connector is handling for bucketing
   velox::type::fbhive::HiveTypeParser hiveTypeParser;
   auto type = stringToType(icebergColumn->type, typeParser);
-  velox::connector::hive::HiveColumnHandle::ColumnParseParameters
-      columnParseParameters;
-  if (type->isDate()) {
-    columnParseParameters.partitionDateValueFormat = velox::connector::hive::
-        HiveColumnHandle::ColumnParseParameters::kDaysSinceEpoch;
+
+  std::optional<std::string> defaultValue;
+  if (icebergColumn->defaultValue) {
+    defaultValue = *icebergColumn->defaultValue;
   }
 
   return std::make_unique<velox::connector::hive::iceberg::IcebergColumnHandle>(
@@ -256,7 +253,8 @@ IcebergPrestoToVeloxConnector::toVeloxColumnHandle(
       toHiveColumnType(icebergColumn->columnType),
       type,
       toParquetField(icebergColumn->columnIdentity),
-      toRequiredSubfields(icebergColumn->requiredSubfields));
+      toRequiredSubfields(icebergColumn->requiredSubfields),
+      defaultValue);
 }
 
 std::unique_ptr<velox::connector::ConnectorTableHandle>
@@ -312,13 +310,42 @@ IcebergPrestoToVeloxConnector::toVeloxTableHandle(
   return toIcebergTableHandle(
       icebergLayout->domainPredicate,
       icebergLayout->remainingPredicate,
-      icebergLayout->pushdownFilterEnabled,
       tableName,
       icebergLayout->dataColumns,
       tableHandle,
       columnHandles,
       exprConverter,
       typeParser);
+}
+
+std::unique_ptr<velox::connector::ConnectorInsertTableHandle>
+IcebergPrestoToVeloxConnector::toVeloxInsertTableHandle(
+    const protocol::ExecuteProcedureHandle* executeProcedureHandle,
+    const TypeParser& typeParser) const {
+  auto icebergDistributedProcedureHandle = std::dynamic_pointer_cast<
+      protocol::iceberg::IcebergDistributedProcedureHandle>(
+      executeProcedureHandle->handle.connectorHandle);
+
+  VELOX_CHECK_NOT_NULL(
+      icebergDistributedProcedureHandle,
+      "Unexpected call distributed procedure handle type {}",
+      executeProcedureHandle->handle.connectorHandle->_type);
+
+  const auto inputColumns = toIcebergColumns(
+      icebergDistributedProcedureHandle->inputColumns, typeParser);
+
+  return std::make_unique<
+      velox::connector::hive::iceberg::IcebergInsertTableHandle>(
+      inputColumns,
+      std::make_shared<velox::connector::hive::LocationHandle>(
+          fmt::format("{}/data", icebergDistributedProcedureHandle->outputPath),
+          fmt::format("{}/data", icebergDistributedProcedureHandle->outputPath),
+          velox::connector::hive::LocationHandle::TableType::kExisting),
+      toVeloxFileFormat(icebergDistributedProcedureHandle->fileFormat),
+      toVeloxIcebergPartitionSpec(
+          icebergDistributedProcedureHandle->partitionSpec, typeParser),
+      std::optional(toFileCompressionKind(
+          icebergDistributedProcedureHandle->compressionCodec)));
 }
 
 std::unique_ptr<protocol::ConnectorProtocol>

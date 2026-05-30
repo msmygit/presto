@@ -314,6 +314,12 @@ public abstract class AbstractMockMetadata
     }
 
     @Override
+    public void setColumnDefault(Session session, TableHandle tableHandle, String columnName, Object defaultValue)
+    {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
     public void addColumn(Session session, TableHandle tableHandle, ColumnMetadata column)
     {
         throw new UnsupportedOperationException();
@@ -333,6 +339,12 @@ public abstract class AbstractMockMetadata
 
     @Override
     public Optional<NewTableLayout> getNewTableLayout(Session session, String catalogName, ConnectorTableMetadata tableMetadata)
+    {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public void setColumnType(Session session, TableHandle tableHandle, ColumnHandle column, Type type)
     {
         throw new UnsupportedOperationException();
     }
@@ -580,6 +592,12 @@ public abstract class AbstractMockMetadata
     }
 
     @Override
+    public void setMaterializedViewProperties(Session session, QualifiedObjectName viewName, Map<String, Object> properties)
+    {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
     public InsertTableHandle beginRefreshMaterializedView(Session session, TableHandle tableHandle)
     {
         throw new UnsupportedOperationException();
@@ -755,6 +773,12 @@ public abstract class AbstractMockMetadata
 
     @Override
     public void createBranch(Session session, TableHandle tableHandle, String branchName, boolean replace, boolean ifNotExists, Optional<ConnectorTableVersion> tableVersion, Optional<Long> retainDays, Optional<Integer> minSnapshotsToKeep, Optional<Long> maxSnapshotAgeDays)
+    {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public void createTag(Session session, TableHandle tableHandle, String branchName, boolean replace, boolean ifNotExists, Optional<ConnectorTableVersion> tableVersion, Optional<Long> retainDays)
     {
         throw new UnsupportedOperationException();
     }

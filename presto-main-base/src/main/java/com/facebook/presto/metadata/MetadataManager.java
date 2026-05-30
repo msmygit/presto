@@ -118,6 +118,7 @@ import static com.facebook.presto.SystemSessionProperties.isIgnoreStatsCalculato
 import static com.facebook.presto.common.RuntimeMetricName.GET_IDENTIFIER_NORMALIZATION_TIME_NANOS;
 import static com.facebook.presto.common.RuntimeMetricName.GET_LAYOUT_TIME_NANOS;
 import static com.facebook.presto.common.RuntimeMetricName.GET_MATERIALIZED_VIEW_STATUS_TIME_NANOS;
+import static com.facebook.presto.common.RuntimeMetricName.GET_TABLE_STATISTICS_TIME_NANOS;
 import static com.facebook.presto.common.RuntimeUnit.NANO;
 import static com.facebook.presto.common.function.OperatorType.BETWEEN;
 import static com.facebook.presto.common.function.OperatorType.EQUAL;
@@ -587,7 +588,9 @@ public class MetadataManager
         try {
             ConnectorId connectorId = tableHandle.getConnectorId();
             ConnectorMetadata metadata = getMetadata(session, connectorId);
-            return metadata.getTableStatistics(session.toConnectorSession(connectorId), tableHandle.getConnectorHandle(), tableHandle.getLayout(), columnHandles, constraint);
+            return session.getRuntimeStats().recordWallTime(
+                    GET_TABLE_STATISTICS_TIME_NANOS,
+                    () -> metadata.getTableStatistics(session.toConnectorSession(connectorId), tableHandle.getConnectorHandle(), tableHandle.getLayout(), columnHandles, constraint));
         }
         catch (RuntimeException e) {
             if (isIgnoreStatsCalculatorFailures(session)) {
@@ -816,11 +819,27 @@ public class MetadataManager
     }
 
     @Override
+    public void setColumnDefault(Session session, TableHandle tableHandle, String columnName, Object defaultValue)
+    {
+        ConnectorId connectorId = tableHandle.getConnectorId();
+        ConnectorMetadata metadata = getMetadataForWrite(session, connectorId);
+        metadata.setColumnDefault(session.toConnectorSession(connectorId), tableHandle.getConnectorHandle(), columnName, defaultValue);
+    }
+
+    @Override
     public void dropColumn(Session session, TableHandle tableHandle, ColumnHandle column)
     {
         ConnectorId connectorId = tableHandle.getConnectorId();
         ConnectorMetadata metadata = getMetadataForWrite(session, connectorId);
         metadata.dropColumn(session.toConnectorSession(connectorId), tableHandle.getConnectorHandle(), column);
+    }
+
+    @Override
+    public void setColumnType(Session session, TableHandle tableHandle, ColumnHandle column, Type type)
+    {
+        ConnectorId connectorId = tableHandle.getConnectorId();
+        ConnectorMetadata metadata = getMetadataForWrite(session, connectorId);
+        metadata.setColumnType(session.toConnectorSession(connectorId), tableHandle.getConnectorHandle(), column, type);
     }
 
     @Override
@@ -955,6 +974,27 @@ public class MetadataManager
         ConnectorId connectorId = tableHandle.getConnectorId();
         ConnectorMetadata metadata = getMetadata(session, connectorId);
         return metadata.finishCreateTable(session.toConnectorSession(connectorId), tableHandle.getConnectorHandle(), fragments, computedStatistics);
+    }
+
+    @Override
+    public OutputTableHandle beginCreateVectorIndex(Session session, String catalogName, ConnectorTableMetadata indexMetadata, Optional<NewTableLayout> layout, SchemaTableName sourceTableName)
+    {
+        CatalogMetadata catalogMetadata = getCatalogMetadataForWrite(session, catalogName);
+        ConnectorId connectorId = catalogMetadata.getConnectorId();
+        ConnectorMetadata metadata = catalogMetadata.getMetadata();
+
+        ConnectorTransactionHandle transactionHandle = catalogMetadata.getTransactionHandleFor(connectorId);
+        ConnectorSession connectorSession = session.toConnectorSession(connectorId);
+        ConnectorOutputTableHandle handle = metadata.beginCreateVectorIndex(connectorSession, indexMetadata, layout.map(NewTableLayout::getLayout), sourceTableName);
+        return new OutputTableHandle(connectorId, transactionHandle, handle);
+    }
+
+    @Override
+    public Optional<ConnectorOutputMetadata> finishCreateVectorIndex(Session session, OutputTableHandle tableHandle, Collection<Slice> fragments, Collection<ComputedStatistics> computedStatistics)
+    {
+        ConnectorId connectorId = tableHandle.getConnectorId();
+        ConnectorMetadata metadata = getMetadata(session, connectorId);
+        return metadata.finishCreateVectorIndex(session.toConnectorSession(connectorId), tableHandle.getConnectorHandle(), fragments, computedStatistics);
     }
 
     @Override
@@ -1243,6 +1283,19 @@ public class MetadataManager
         ConnectorMetadata metadata = catalogMetadata.getMetadata();
 
         metadata.dropMaterializedView(session.toConnectorSession(connectorId), toSchemaTableName(viewName.getSchemaName(), viewName.getObjectName()));
+    }
+
+    @Override
+    public void setMaterializedViewProperties(Session session, QualifiedObjectName viewName, Map<String, Object> properties)
+    {
+        CatalogMetadata catalogMetadata = getCatalogMetadataForWrite(session, viewName.getCatalogName());
+        ConnectorId connectorId = catalogMetadata.getConnectorId();
+        ConnectorMetadata metadata = catalogMetadata.getMetadata();
+
+        metadata.setMaterializedViewProperties(
+                session.toConnectorSession(connectorId),
+                toSchemaTableName(viewName.getSchemaName(), viewName.getObjectName()),
+                properties);
     }
 
     @Override
@@ -1752,6 +1805,14 @@ public class MetadataManager
         ConnectorId connectorId = tableHandle.getConnectorId();
         ConnectorMetadata metadata = getMetadataForWrite(session, connectorId);
         metadata.createBranch(session.toConnectorSession(connectorId), tableHandle.getConnectorHandle(), branchName, replace, ifNotExists, tableVersion, retainDays, minSnapshotsToKeep, maxSnapshotAgeDays);
+    }
+
+    @Override
+    public void createTag(Session session, TableHandle tableHandle, String tagName, boolean replace, boolean ifNotExists, Optional<ConnectorTableVersion> tableVersion, Optional<Long> retainDays)
+    {
+        ConnectorId connectorId = tableHandle.getConnectorId();
+        ConnectorMetadata metadata = getMetadataForWrite(session, connectorId);
+        metadata.createTag(session.toConnectorSession(connectorId), tableHandle.getConnectorHandle(), tagName, replace, ifNotExists, tableVersion, retainDays);
     }
 
     @Override
